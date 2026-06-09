@@ -1,0 +1,47 @@
+{
+  "name": "voku/error-handler-lib",
+  "description": "Portable PHP error-handler library with integration hooks for application-specific logging and rendering.",
+  "type": "library",
+  "license": "MIT",
+  "homepage": "https://github.com/voku/error-handler-lib",
+  "support": {
+    "issues": "https://github.com/voku/error-handler-lib/issues",
+    "source": "https://github.com/voku/error-handler-lib"
+  },
+  "authors": [
+    {
+      "name": "Lars Moelleken",
+      "homepage": "https://github.com/voku"
+    }
+  ],
+  "require": {
+    "php": "^8.3"
+  },
+  "require-dev": {
+    "phpstan/phpstan": "^2.1",
+    "phpunit/phpunit": "^11.5"
+  },
+  "autoload": {
+    "psr-4": {
+      "voku\\ErrorHandlerLib\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "voku\\ErrorHandlerLib\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "test": "phpunit",
+    "phpstan": "phpstan analyse --configuration=phpstan.neon.dist",
+    "ci": [
+      "@composer validate --strict",
+      "@test",
+      "@phpstan"
+    ]
+  },
+  "config": {
+    "allow-plugins": false,
+    "sort-packages": true
+  }
+}
