@@ -23,6 +23,17 @@ final class ErrorHandlerDefaultIntegration implements ErrorHandlerIntegrationInt
         return false;
     }
 
+    /**
+     * Suppressed diagnostics stay observable by default.
+     *
+     * Hiding them would remove the main reason to install this handler at all; a host that
+     * wants PHP's normal suppression semantics opts out explicitly.
+     */
+    public function suppressedDiagnosticPolicy(): SuppressedDiagnosticPolicy
+    {
+        return SuppressedDiagnosticPolicy::Observe;
+    }
+
     public function isDebugBarRequest(): bool
     {
         return false;

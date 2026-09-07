@@ -110,6 +110,16 @@ final class ErrorHandlerLib
     }
 
     /**
+     * Processes one diagnostic in a fixed, documented order:
+     *
+     *   1. critical/fatal diagnostics are handled unconditionally;
+     *   2. PHP suppression is checked against the host's {@see SuppressedDiagnosticPolicy};
+     *   3. the host's {@see ErrorHandlerSkipDeciderInterface} may drop the diagnostic;
+     *   4. debug-bar, logging and rendering side effects run.
+     *
+     * Steps 2 and 3 apply to non-critical diagnostics only, so neither a suppression policy
+     * nor a skip decider can hide a fatal error or an uncaught exception.
+     *
      * @param array<string, scalar|null>     $context
      * @param null|TraceList          $backtrace
      */
@@ -121,25 +131,33 @@ final class ErrorHandlerLib
         array $context = [],
         ?array $backtrace = null
     ): bool {
-        $echoOutput = $this->integration->shouldEchoOutput();
-
-        if ($this->integration->isDebugBarRequest()) {
-            $this->addDebugBarError($errno, $errstr, $errfile, $errline, $context, $backtrace);
+        if (self::isCriticalDiagnostic($errno)) {
+            $this->handleCriticalDiagnostic($errno, $errstr, $errfile, $errline, $context, $backtrace);
         }
 
-        if (($errno & (E_ALL ^ (E_NOTICE | E_USER_NOTICE | E_WARNING | E_USER_WARNING | E_DEPRECATED | E_USER_DEPRECATED))) !== 0) {
-            $details = $this->buildErrorDetails('PHP-ERROR', $errno, $errstr, $errfile, $errline, $context, $backtrace);
+        $renderingAllowed = true;
 
-            error_log($details);
+        if (self::isSuppressedByPhp($errno)) {
+            $policy = $this->integration->suppressedDiagnosticPolicy();
 
-            $this->integration->renderCriticalError($details, $echoOutput);
+            if ($policy === SuppressedDiagnosticPolicy::Ignore) {
+                return false;
+            }
+
+            $renderingAllowed = $policy !== SuppressedDiagnosticPolicy::LogOnly;
         }
 
         if ($this->skipDecider->shouldSkip($errno, $errstr, $errfile, $errline)) {
             return true;
         }
 
-        if (($errno & (E_ALL ^ (E_NOTICE | E_USER_NOTICE | E_DEPRECATED | E_USER_DEPRECATED))) !== 0) {
+        if ($this->integration->isDebugBarRequest()) {
+            $this->addDebugBarError($errno, $errstr, $errfile, $errline, $context, $backtrace);
+        }
+
+        $echoOutput = $renderingAllowed && $this->integration->shouldEchoOutput();
+
+        if (self::isWarningDiagnostic($errno)) {
             $details = $this->buildErrorDetails('PHP-WARNING', $errno, $errstr, $errfile, $errline, $context, $backtrace);
 
             error_log($details);
@@ -249,6 +267,55 @@ final class ErrorHandlerLib
         ini_set('display_startup_errors', 'Off');
 
         return $this;
+    }
+
+    /**
+     * A diagnostic is critical when it is neither a notice, a warning, nor a deprecation.
+     *
+     * Critical diagnostics bypass suppression policy and skip filtering entirely.
+     */
+    private static function isCriticalDiagnostic(int $errno): bool
+    {
+        return ($errno & (E_ALL ^ (E_NOTICE | E_USER_NOTICE | E_WARNING | E_USER_WARNING | E_DEPRECATED | E_USER_DEPRECATED))) !== 0;
+    }
+
+    private static function isWarningDiagnostic(int $errno): bool
+    {
+        return ($errno & (E_ALL ^ (E_NOTICE | E_USER_NOTICE | E_DEPRECATED | E_USER_DEPRECATED))) !== 0;
+    }
+
+    /**
+     * Whether PHP itself excluded this diagnostic from the currently active reporting state.
+     *
+     * Inside an error handler `error_reporting()` still reflects the state that was active when
+     * the diagnostic was raised, so this detects both `@expr` and an explicit reporting mask.
+     */
+    private static function isSuppressedByPhp(int $errno): bool
+    {
+        return (error_reporting() & $errno) === 0;
+    }
+
+    /**
+     * @param array<string, scalar|null> $context
+     * @param null|TraceList             $backtrace
+     */
+    private function handleCriticalDiagnostic(
+        int $errno,
+        string $errstr,
+        string $errfile,
+        int $errline,
+        array $context,
+        ?array $backtrace
+    ): never {
+        if ($this->integration->isDebugBarRequest()) {
+            $this->addDebugBarError($errno, $errstr, $errfile, $errline, $context, $backtrace);
+        }
+
+        $details = $this->buildErrorDetails('PHP-ERROR', $errno, $errstr, $errfile, $errline, $context, $backtrace);
+
+        error_log($details);
+
+        $this->integration->renderCriticalError($details, $this->integration->shouldEchoOutput());
     }
 
     private static function stringifyError(string|Throwable $error): string

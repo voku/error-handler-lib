@@ -12,6 +12,7 @@ use voku\ErrorHandlerLib\ErrorHandlerIntegrationInterface;
 use voku\ErrorHandlerLib\ErrorHandlerLib;
 use voku\ErrorHandlerLib\ErrorHandlerNoOpSkipDecider;
 use voku\ErrorHandlerLib\ErrorHandlerSkipDeciderInterface;
+use voku\ErrorHandlerLib\SuppressedDiagnosticPolicy;
 
 final class ErrorHandlerLibTest extends TestCase
 {
@@ -277,6 +278,370 @@ final class ErrorHandlerLibTest extends TestCase
         $handler->handleError(E_USER_ERROR, 'Boom', '/tmp/example.php', 42, ['foo' => 'bar'], []);
     }
 
+    public function testSuppressedWarningStaysObservableByDefault(): void
+    {
+        $rendered = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                shouldEchoOutput: static fn (): bool => true,
+                renderNonCriticalError: static function (string $label, string $details, bool $echoOutput) use (&$rendered): void {
+                    $rendered[] = [$label, $details, $echoOutput];
+                }
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $log = $this->captureErrorLog(static function () use ($handler): void {
+            set_error_handler($handler->handleError(...), E_ALL);
+
+            try {
+                // Deliberate `@` fixture: this is the developer-facing behavior the library exists for.
+                @file_get_contents(__DIR__ . '/fixture-that-does-not-exist');
+            } finally {
+                restore_error_handler();
+            }
+        }, E_ALL);
+
+        self::assertCount(1, $rendered, 'A PHP-suppressed warning must stay visible by default.');
+        self::assertSame('Warning', $rendered[0][0]);
+        self::assertStringContainsString('fixture-that-does-not-exist', $rendered[0][1]);
+        self::assertStringContainsString('PHP-WARNING', $log);
+    }
+
+    public function testIgnorePolicyProducesNoObservableSideEffectsForSuppressedWarning(): void
+    {
+        $rendered = [];
+        $debugBarMessages = [];
+        $sanitizeCalls = 0;
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                sanitizeErrorDetails: static function (string $details) use (&$sanitizeCalls): string {
+                    $sanitizeCalls++;
+
+                    return $details;
+                },
+                shouldEchoOutput: static fn (): bool => true,
+                isDebugBarRequest: static fn (): bool => true,
+                addDebugBarMessage: static function (int $errno, string $description) use (&$debugBarMessages): void {
+                    $debugBarMessages[] = [$errno, $description];
+                },
+                renderNonCriticalError: static function (string $label, string $details, bool $echoOutput) use (&$rendered): void {
+                    $rendered[] = [$label, $details, $echoOutput];
+                },
+                suppressedDiagnosticPolicy: SuppressedDiagnosticPolicy::Ignore
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $returned = null;
+        $log = $this->captureErrorLog(static function () use ($handler, &$returned): void {
+            set_error_handler(static function (int $errno, string $errstr, string $errfile = '', int $errline = 0) use ($handler, &$returned): bool {
+                $returned = $handler->handleError($errno, $errstr, $errfile, $errline);
+
+                return true;
+            }, E_ALL);
+
+            try {
+                @file_get_contents(__DIR__ . '/fixture-that-does-not-exist');
+            } finally {
+                restore_error_handler();
+            }
+        }, E_ALL);
+
+        self::assertSame([], $rendered);
+        self::assertSame([], $debugBarMessages);
+        self::assertSame(0, $sanitizeCalls);
+        self::assertSame('', $log);
+        self::assertFalse($returned, 'Ignore defers to PHP instead of claiming the diagnostic was handled.');
+    }
+
+    public function testLogOnlyPolicyKeepsProcessingButSuppressesRendering(): void
+    {
+        $rendered = [];
+        $debugBarMessages = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                shouldEchoOutput: static fn (): bool => true,
+                isDebugBarRequest: static fn (): bool => true,
+                addDebugBarMessage: static function (int $errno, string $description) use (&$debugBarMessages): void {
+                    $debugBarMessages[] = [$errno, $description];
+                },
+                renderNonCriticalError: static function (string $label, string $details, bool $echoOutput) use (&$rendered): void {
+                    $rendered[] = [$label, $details, $echoOutput];
+                },
+                suppressedDiagnosticPolicy: SuppressedDiagnosticPolicy::LogOnly
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $log = $this->captureErrorLog(static function () use ($handler): void {
+            set_error_handler($handler->handleError(...), E_ALL);
+
+            try {
+                @file_get_contents(__DIR__ . '/fixture-that-does-not-exist');
+            } finally {
+                restore_error_handler();
+            }
+        }, E_ALL);
+
+        self::assertSame([], $rendered, 'LogOnly must not render a suppressed diagnostic.');
+        self::assertCount(1, $debugBarMessages);
+        self::assertStringContainsString('PHP-WARNING', $log);
+    }
+
+    public function testUnsuppressedWarningIsUnaffectedByIgnorePolicy(): void
+    {
+        $rendered = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                shouldEchoOutput: static fn (): bool => true,
+                renderNonCriticalError: static function (string $label, string $details, bool $echoOutput) use (&$rendered): void {
+                    $rendered[] = [$label, $details, $echoOutput];
+                },
+                suppressedDiagnosticPolicy: SuppressedDiagnosticPolicy::Ignore
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $this->captureErrorLog(static function () use ($handler): void {
+            set_error_handler($handler->handleError(...), E_ALL);
+
+            try {
+                file_get_contents(__DIR__ . '/fixture-that-does-not-exist');
+            } finally {
+                restore_error_handler();
+            }
+        }, E_ALL);
+
+        self::assertCount(1, $rendered, 'The policy applies to suppressed diagnostics only.');
+    }
+
+    public function testSkippedDiagnosticProducesNoObservableSideEffects(): void
+    {
+        $rendered = [];
+        $debugBarMessages = [];
+        $sanitizeCalls = 0;
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                sanitizeErrorDetails: static function (string $details) use (&$sanitizeCalls): string {
+                    $sanitizeCalls++;
+
+                    return $details;
+                },
+                shouldEchoOutput: static fn (): bool => true,
+                isTestingEnvironment: static fn (): bool => true,
+                isDebugBarRequest: static fn (): bool => true,
+                addDebugBarMessage: static function (int $errno, string $description) use (&$debugBarMessages): void {
+                    $debugBarMessages[] = [$errno, $description];
+                },
+                renderNonCriticalError: static function (string $label, string $details, bool $echoOutput) use (&$rendered): void {
+                    $rendered[] = [$label, $details, $echoOutput];
+                }
+            ),
+            new class() implements ErrorHandlerSkipDeciderInterface {
+                public function shouldSkip(int $errno, string $errstr, string $errfile, int $errline): bool
+                {
+                    return true;
+                }
+            }
+        );
+
+        $returned = null;
+        $log = $this->captureErrorLog(static function () use ($handler, &$returned): void {
+            $returned = $handler->handleError(E_USER_WARNING, 'skip me', '/tmp/test.php', 5);
+        });
+
+        self::assertTrue($returned, 'An application-skipped diagnostic stays fully handled.');
+        self::assertSame([], $rendered);
+        self::assertSame([], $debugBarMessages, 'Skip must run before the debug-bar side effect.');
+        self::assertSame(0, $sanitizeCalls);
+        self::assertSame('', $log);
+    }
+
+    public function testSkipDeciderIsNotConsultedForCriticalDiagnostics(): void
+    {
+        $skipDecider = new class() implements ErrorHandlerSkipDeciderInterface {
+            public bool $consulted = false;
+
+            public function shouldSkip(int $errno, string $errstr, string $errfile, int $errline): bool
+            {
+                $this->consulted = true;
+
+                return true;
+            }
+        };
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                renderCriticalError: static function (string $details, bool $echoOutput): never {
+                    throw new RuntimeException($details);
+                }
+            ),
+            $skipDecider
+        );
+
+        try {
+            $this->captureErrorLog(static function () use ($handler): void {
+                $handler->handleError(E_USER_ERROR, 'Boom', '/tmp/example.php', 42);
+            });
+
+            self::fail('A critical diagnostic must never be skippable.');
+        } catch (RuntimeException $exception) {
+            self::assertStringContainsString('PHP-ERROR', $exception->getMessage());
+        }
+
+        self::assertFalse($skipDecider->consulted);
+    }
+
+    public function testSuppressedDiagnosticPolicyIsNotConsultedForCriticalDiagnostics(): void
+    {
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                renderCriticalError: static function (string $details, bool $echoOutput): never {
+                    throw new RuntimeException($details);
+                },
+                suppressedDiagnosticPolicy: SuppressedDiagnosticPolicy::Ignore
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $previousLevel = error_reporting(0);
+
+        try {
+            $this->captureErrorLog(static function () use ($handler): void {
+                $handler->handleError(E_USER_ERROR, 'Boom', '/tmp/example.php', 42);
+            });
+
+            self::fail('A critical diagnostic must never be hidden by the suppression policy.');
+        } catch (RuntimeException $exception) {
+            self::assertStringContainsString('PHP-ERROR', $exception->getMessage());
+        } finally {
+            error_reporting($previousLevel);
+        }
+    }
+
+    public function testHandleExceptionSurvivesAnErrorReportingMaskThatExcludesErrors(): void
+    {
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                renderCriticalError: static function (string $details, bool $echoOutput): never {
+                    throw new RuntimeException($details);
+                },
+                suppressedDiagnosticPolicy: SuppressedDiagnosticPolicy::Ignore
+            ),
+            new class() implements ErrorHandlerSkipDeciderInterface {
+                public function shouldSkip(int $errno, string $errstr, string $errfile, int $errline): bool
+                {
+                    return true;
+                }
+            }
+        );
+
+        $previousLevel = error_reporting(0);
+
+        try {
+            $this->captureErrorLog(static function () use ($handler): void {
+                $handler->handleException(new RuntimeException('uncaught failure'));
+            });
+
+            self::fail('An uncaught exception must never disappear because of error_reporting().');
+        } catch (RuntimeException $exception) {
+            self::assertStringContainsString('RuntimeException: uncaught failure', $exception->getMessage());
+        } finally {
+            error_reporting($previousLevel);
+        }
+    }
+
+    public function testUncaughtThrowableSurvivesTheMostHostileHostPolicy(): void
+    {
+        $output = $this->runFixture('uncaught-error-under-narrow-error-reporting.php');
+
+        self::assertStringContainsString(
+            "Failed opening required '",
+            $output,
+            'An uncaught throwable must survive Ignore policy, error_reporting(0) and a skip-everything decider.'
+        );
+        self::assertStringContainsString('ERROR ON CLI', $output);
+    }
+
+    public function testShutdownFatalErrorSurvivesTheMostHostileHostPolicy(): void
+    {
+        $output = $this->runFixture('fatal-shutdown-under-narrow-error-reporting.php');
+
+        // PHP words the redeclaration fatal differently across 8.3 and 8.4+, so assert on the
+        // invariant (the fatal reached critical rendering) rather than on PHP's phrasing.
+        self::assertStringContainsString(
+            'FixtureClassDeclaredTwice',
+            $output,
+            'A shutdown-detected fatal error must survive Ignore policy and a skip-everything decider.'
+        );
+        self::assertStringContainsString('PHP-ERROR', $output);
+        self::assertStringContainsString('ERROR ON CLI', $output);
+    }
+
+    /**
+     * Runs a fixture script in its own PHP process and returns its combined output.
+     *
+     * The fatal and shutdown paths cannot be exercised in-process, so they are proven end to end.
+     */
+    private function runFixture(string $fixtureName): string
+    {
+        $fixture = __DIR__ . '/Fixture/' . $fixtureName;
+        self::assertFileExists($fixture);
+
+        $process = proc_open(
+            [PHP_BINARY, $fixture],
+            [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes
+        );
+        self::assertIsResource($process);
+
+        $stdout = (string) stream_get_contents($pipes[1]);
+        $stderr = (string) stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+
+        self::assertSame(1, proc_close($process), 'The fixture must exit through renderCriticalError().');
+
+        return $stdout . $stderr;
+    }
+
+    /**
+     * Runs $callback with `error_log()` redirected into a temporary file and returns what was written.
+     *
+     * $errorReporting pins the reporting level for the duration of the callback. Tests that exercise
+     * `@` need `E_ALL` here: PHPUnit narrows `error_reporting()` to a fatal-only mask while a test
+     * runs, which would otherwise make every warning look PHP-suppressed and let the assertion pass
+     * for the wrong reason.
+     */
+    private function captureErrorLog(Closure $callback, ?int $errorReporting = null): string
+    {
+        $logFile = tempnam(sys_get_temp_dir(), 'error-handler-lib-');
+        self::assertIsString($logFile);
+
+        $previousDestination = (string) ini_get('error_log');
+        $previousLogErrors = (string) ini_get('log_errors');
+        ini_set('error_log', $logFile);
+        ini_set('log_errors', '1');
+
+        $previousLevel = $errorReporting === null ? null : error_reporting($errorReporting);
+
+        try {
+            $callback();
+        } finally {
+            if ($previousLevel !== null) {
+                error_reporting($previousLevel);
+            }
+
+            ini_set('error_log', $previousDestination);
+            ini_set('log_errors', $previousLogErrors);
+        }
+
+        $written = (string) file_get_contents($logFile);
+        unlink($logFile);
+
+        return $written;
+    }
+
     private function createIntegration(
         ?Closure $describeObject = null,
         ?Closure $renderJavaScriptErrorHandler = null,
@@ -287,9 +652,10 @@ final class ErrorHandlerLibTest extends TestCase
         ?Closure $isTestingEnvironment = null,
         ?Closure $isDebugBarRequest = null,
         ?Closure $addDebugBarMessage = null,
-        ?Closure $renderNonCriticalError = null
+        ?Closure $renderNonCriticalError = null,
+        SuppressedDiagnosticPolicy $suppressedDiagnosticPolicy = SuppressedDiagnosticPolicy::Observe
     ): ErrorHandlerIntegrationInterface {
-        return new class($describeObject, $renderJavaScriptErrorHandler, $getGlobalInfo, $sanitizeErrorDetails, $renderCriticalError, $shouldEchoOutput, $isTestingEnvironment, $isDebugBarRequest, $addDebugBarMessage, $renderNonCriticalError) implements ErrorHandlerIntegrationInterface {
+        return new class($describeObject, $renderJavaScriptErrorHandler, $getGlobalInfo, $sanitizeErrorDetails, $renderCriticalError, $shouldEchoOutput, $isTestingEnvironment, $isDebugBarRequest, $addDebugBarMessage, $renderNonCriticalError, $suppressedDiagnosticPolicy) implements ErrorHandlerIntegrationInterface {
             public function __construct(
                 private readonly ?Closure $describeObject,
                 private readonly ?Closure $renderJavaScriptErrorHandler,
@@ -300,8 +666,14 @@ final class ErrorHandlerLibTest extends TestCase
                 private readonly ?Closure $isTestingEnvironment,
                 private readonly ?Closure $isDebugBarRequest,
                 private readonly ?Closure $addDebugBarMessage,
-                private readonly ?Closure $renderNonCriticalError
+                private readonly ?Closure $renderNonCriticalError,
+                private readonly SuppressedDiagnosticPolicy $suppressedDiagnosticPolicy
             ) {
+            }
+
+            public function suppressedDiagnosticPolicy(): SuppressedDiagnosticPolicy
+            {
+                return $this->suppressedDiagnosticPolicy;
             }
 
             public function shouldEchoOutput(): bool

@@ -12,6 +12,14 @@ interface ErrorHandlerIntegrationInterface
 
     public function isTestingEnvironment(): bool;
 
+    /**
+     * Decides whether diagnostics that PHP itself excluded from `error_reporting()`
+     * (via `@` or an explicit mask) are still processed by the error handler.
+     *
+     * This is never consulted for critical/fatal diagnostics or uncaught exceptions.
+     */
+    public function suppressedDiagnosticPolicy(): SuppressedDiagnosticPolicy;
+
     public function isDebugBarRequest(): bool;
 
     public function addDebugBarMessage(int $errno, string $description): void;
