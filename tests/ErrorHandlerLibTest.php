@@ -578,6 +578,188 @@ final class ErrorHandlerLibTest extends TestCase
         self::assertStringContainsString('ERROR ON CLI', $output);
     }
 
+    public function testDebugPromptSaysWhenPhpHadHiddenTheDiagnostic(): void
+    {
+        $handler = new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider());
+
+        $previousLevel = error_reporting(E_ALL & ~E_USER_WARNING);
+
+        try {
+            $prompt = $handler->debugPrompt(E_USER_WARNING, 'hidden failure', '/app/src/Loader.php', 42);
+        } finally {
+            error_reporting($previousLevel);
+        }
+
+        self::assertStringContainsString('E_USER_WARNING (512)', $prompt);
+        self::assertStringContainsString('would normally have been invisible', $prompt);
+        self::assertStringContainsString('Do not restore the suppression.', $prompt);
+        self::assertStringContainsString('/app/src/Loader.php:42', $prompt);
+    }
+
+    public function testDebugPromptSaysWhenTheDiagnosticWasReportedNormally(): void
+    {
+        $handler = new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider());
+
+        $previousLevel = error_reporting(E_ALL);
+
+        try {
+            $prompt = $handler->debugPrompt(E_USER_WARNING, 'plain failure', '/app/src/Loader.php', 42);
+        } finally {
+            error_reporting($previousLevel);
+        }
+
+        self::assertStringContainsString('reported normally by PHP', $prompt);
+        self::assertStringNotContainsString('would normally have been invisible', $prompt);
+        self::assertStringContainsString('Do not silence it with `@`', $prompt);
+    }
+
+    public function testDebugPromptIsDeterministic(): void
+    {
+        $handler = new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider());
+        $backtrace = [['file' => '/app/src/Loader.php', 'line' => 42, 'class' => 'App\\Loader', 'type' => '->', 'function' => 'read']];
+
+        $first = $handler->debugPrompt(E_USER_WARNING, 'same failure', '/app/src/Loader.php', 42, ['job' => 'nightly'], $backtrace);
+        $second = $handler->debugPrompt(E_USER_WARNING, 'same failure', '/app/src/Loader.php', 42, ['job' => 'nightly'], $backtrace);
+
+        self::assertSame($first, $second, 'The same diagnostic must render byte-identical prompts.');
+    }
+
+    public function testDebugPromptRendersTheCallPathWithoutArgumentValues(): void
+    {
+        $handler = new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider());
+
+        $prompt = $handler->debugPrompt(
+            E_USER_WARNING,
+            'connect failed',
+            '/app/src/Loader.php',
+            42,
+            [],
+            [
+                [
+                    'file' => '/app/src/Loader.php',
+                    'line' => 42,
+                    'class' => 'App\\Loader',
+                    'type' => '->',
+                    'function' => 'connect',
+                    'args' => ['db-user', 'hunter2-should-never-be-rendered'],
+                ],
+                ['file' => '/app/public/index.php', 'line' => 12, 'function' => 'include'],
+            ]
+        );
+
+        self::assertStringContainsString('1. /app/src/Loader.php:42 App\\Loader->connect()', $prompt);
+        self::assertStringContainsString('2. /app/public/index.php:12 include()', $prompt);
+        self::assertStringNotContainsString('hunter2-should-never-be-rendered', $prompt);
+    }
+
+    public function testDebugPromptOmitsTheHandlersOwnFrames(): void
+    {
+        $handler = new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider());
+
+        $prompt = $handler->debugPrompt(
+            E_USER_WARNING,
+            'noise',
+            '/app/src/Loader.php',
+            42,
+            [],
+            [
+                ['file' => '/app/src/Loader.php', 'line' => 42, 'class' => ErrorHandlerLib::class, 'type' => '->', 'function' => 'handleError'],
+                ['file' => '/app/src/Loader.php', 'line' => 42, 'class' => 'App\\Loader', 'type' => '->', 'function' => 'read'],
+            ]
+        );
+
+        self::assertStringNotContainsString('handleError()', $prompt);
+        self::assertStringContainsString('1. /app/src/Loader.php:42 App\\Loader->read()', $prompt);
+    }
+
+    public function testDebugPromptPassesThroughTheIntegrationSanitizer(): void
+    {
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                sanitizeErrorDetails: static fn (string $details): string => str_replace('s3cr3t', '[redacted]', $details)
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $prompt = $handler->debugPrompt(E_USER_WARNING, 'token s3cr3t rejected', '/app/src/Loader.php', 42);
+
+        self::assertStringNotContainsString('s3cr3t', $prompt);
+        self::assertStringContainsString('[redacted]', $prompt);
+    }
+
+    public function testRenderedWarningReportCarriesThePromptButTheLogDoesNot(): void
+    {
+        $rendered = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                shouldEchoOutput: static fn (): bool => true,
+                renderNonCriticalError: static function (string $label, string $details, bool $echoOutput) use (&$rendered): void {
+                    $rendered[] = $details;
+                }
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $log = $this->captureErrorLog(static function () use ($handler): void {
+            $handler->handleError(E_USER_WARNING, 'render me', '/app/src/Loader.php', 42);
+        }, E_ALL);
+
+        self::assertCount(1, $rendered);
+        self::assertStringContainsString('Warning-Message : render me', $rendered[0]);
+        self::assertStringContainsString('COPY EVERYTHING BELOW INTO A CODING AGENT', $rendered[0]);
+
+        self::assertStringContainsString('render me', $log);
+        self::assertStringNotContainsString(
+            'COPY EVERYTHING BELOW INTO A CODING AGENT',
+            $log,
+            'Logs stay machine-shaped; the agent prompt is for the report a human reads.'
+        );
+    }
+
+    public function testNoPromptIsRenderedWhenTheHostDoesNotEchoOutput(): void
+    {
+        $rendered = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                shouldEchoOutput: static fn (): bool => false,
+                renderNonCriticalError: static function (string $label, string $details, bool $echoOutput) use (&$rendered): void {
+                    $rendered[] = $details;
+                }
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $this->captureErrorLog(static function () use ($handler): void {
+            $handler->handleError(E_USER_WARNING, 'quiet', '/app/src/Loader.php', 42);
+        }, E_ALL);
+
+        self::assertSame([], $rendered);
+    }
+
+    public function testCriticalReportCarriesThePromptWhenOutputIsEchoed(): void
+    {
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                shouldEchoOutput: static fn (): bool => true,
+                renderCriticalError: static function (string $details, bool $echoOutput): never {
+                    throw new RuntimeException($details);
+                }
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        try {
+            $this->captureErrorLog(static function () use ($handler): void {
+                $handler->handleException(new RuntimeException('boom'));
+            }, E_ALL);
+
+            self::fail('Expected critical rendering to throw.');
+        } catch (RuntimeException $exception) {
+            self::assertStringContainsString('RuntimeException: boom', $exception->getMessage());
+            self::assertStringContainsString('COPY EVERYTHING BELOW INTO A CODING AGENT', $exception->getMessage());
+        }
+    }
+
     /**
      * Runs a fixture script in its own PHP process and returns its combined output.
      *

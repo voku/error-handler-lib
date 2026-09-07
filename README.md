@@ -44,6 +44,52 @@ ErrorHandlerLib::useIntegration(new ApplicationErrorIntegration());
 (new ErrorHandlerLib())->register();
 ```
 
+## The error report hands you a prompt
+
+Every rendered error report ends with a copy&paste-ready prompt for a coding agent, built from the
+diagnostic the handler already has:
+
+```text
+----- COPY EVERYTHING BELOW INTO A CODING AGENT -----
+
+A PHP diagnostic was captured by voku/error-handler-lib. Facts first:
+
+  type:       E_WARNING (2)
+  message:    file_get_contents(/etc/app/config.json): Failed to open stream: No such file or directory
+  origin:     src/Config/Loader.php:42
+  visibility: PHP had excluded this diagnostic from error_reporting() (an `@` or an explicit mask),
+              so it would normally have been invisible. You are seeing it because the host
+              policy observes suppressed diagnostics.
+  runtime:    PHP 8.4.19 (cli)
+
+Call path (innermost first, arguments omitted on purpose):
+
+  1. src/Config/Loader.php:42 App\Config\Loader->read()
+  2. src/Kernel.php:88 App\Kernel->boot()
+  ...
+```
+
+It is deterministic: no timestamps, no request identifiers, no environment probing, no model call.
+The same diagnostic always renders the same bytes, so repeated occurrences deduplicate.
+
+The `visibility` line is the part worth having. An agent that is told a warning was hidden by `@`
+does not "fix" it by hiding it again, and the prompt says so explicitly.
+
+Two boundaries it respects:
+
+- **Call arguments are never rendered.** They are the values most likely to hold credentials, so the
+  call path carries navigation only. The whole prompt still passes through
+  `sanitizeErrorDetails()` exactly like the error details do.
+- **Logs stay machine-shaped.** The prompt is appended to what a human is about to read, not to
+  `error_log()`, and only when the integration echoes output.
+
+Call `debugPrompt()` directly to put the same text somewhere else — a debug-bar panel, an issue
+template, a chat message:
+
+```php
+$prompt = $handler->debugPrompt($errno, $errstr, $errfile, $errline, $context, $backtrace);
+```
+
 ## PHP suppression vs. application filtering
 
 The handler is registered for `E_ALL` and does **not** simply obey `error_reporting()`. That is

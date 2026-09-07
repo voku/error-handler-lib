@@ -164,7 +164,11 @@ final class ErrorHandlerLib
 
             if ($echoOutput && $this->warningCounter <= 1) {
                 $this->warningCounter++;
-                $this->integration->renderNonCriticalError('Warning', $details, $echoOutput);
+                $this->integration->renderNonCriticalError(
+                    'Warning',
+                    $details . $this->debugPrompt($errno, $errstr, $errfile, $errline, $context, $backtrace),
+                    $echoOutput
+                );
             }
         } elseif ($this->integration->isTestingEnvironment()) {
             $details = $this->buildErrorDetails('PHP-NOTICE', $errno, $errstr, $errfile, $errline, $context, $backtrace);
@@ -173,7 +177,11 @@ final class ErrorHandlerLib
 
             if ($echoOutput && $this->noticeCounter <= 1) {
                 $this->noticeCounter++;
-                $this->integration->renderNonCriticalError('Notice', $details, $echoOutput);
+                $this->integration->renderNonCriticalError(
+                    'Notice',
+                    $details . $this->debugPrompt($errno, $errstr, $errfile, $errline, $context, $backtrace),
+                    $echoOutput
+                );
             }
         }
 
@@ -182,6 +190,40 @@ final class ErrorHandlerLib
         }
 
         return true;
+    }
+
+    /**
+     * Renders one diagnostic as a copy&paste-ready prompt for a coding agent.
+     *
+     * Rendered error reports already carry this. It is public so a host can put the same prompt
+     * somewhere else - a debug bar panel, an issue template, a chat message - without rebuilding it.
+     *
+     * The result passes through the integration's sanitizer, exactly like the error details do.
+     *
+     * @param array<string, scalar|null> $context
+     * @param null|TraceList             $backtrace
+     */
+    public function debugPrompt(
+        int $errno,
+        string $errstr,
+        string $errfile = '',
+        int $errline = 0,
+        array $context = [],
+        ?array $backtrace = null
+    ): string {
+        return $this->integration->sanitizeErrorDetails(
+            ErrorHandlerDebugPrompt::build(
+                $errno,
+                $errstr,
+                $errfile,
+                $errline,
+                self::isSuppressedByPhp($errno),
+                $context,
+                // PHP does not hand a trace to an error handler, so capture one when the caller has
+                // none. Arguments are dropped at the source: the prompt never renders them.
+                $backtrace ?? debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS)
+            )
+        );
     }
 
     public function handleFatalError(): void
@@ -313,9 +355,15 @@ final class ErrorHandlerLib
 
         $details = $this->buildErrorDetails('PHP-ERROR', $errno, $errstr, $errfile, $errline, $context, $backtrace);
 
+        // Logs stay machine-shaped; only the report a human is about to read gets the agent prompt.
         error_log($details);
 
-        $this->integration->renderCriticalError($details, $this->integration->shouldEchoOutput());
+        $echoOutput = $this->integration->shouldEchoOutput();
+        if ($echoOutput) {
+            $details .= $this->debugPrompt($errno, $errstr, $errfile, $errline, $context, $backtrace);
+        }
+
+        $this->integration->renderCriticalError($details, $echoOutput);
     }
 
     private static function stringifyError(string|Throwable $error): string
