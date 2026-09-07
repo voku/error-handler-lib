@@ -106,6 +106,18 @@ the suppression policy and the skip decider are consulted. Neither can hide them
 `error_reporting()` says. `tests/Fixture/` proves this end to end against the most hostile host
 policy the API allows.
 
+## Pre-1.0 slice prompts
+
+The remaining pre-1.0 work is tracked as independently mergeable slices in
+[`docs/prompts/`](docs/prompts/README.md). Each one is a copy&paste-ready prompt whose repository
+facts — file paths, line ranges, source excerpts, project-native validation commands, the declared
+PHP range — are resolved deterministically from this checkout by `voku/agent-map` and
+`voku/agent-recall-compiler` rather than written by hand:
+
+```bash
+php tools/generate-slice-prompts.php
+```
+
 ## Development
 
 ```bash

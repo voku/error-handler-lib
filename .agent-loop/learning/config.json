@@ -1,0 +1,5 @@
+{
+  "schema_version": "1.0",
+  "active_constraints_dir": "constraints/active",
+  "project_root": "../.."
+}
