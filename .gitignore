@@ -1,6 +1,4 @@
 /vendor/
-/.agent-map/
-/.agent-recall/
 /.phpunit.cache/
 /.phpunit.result.cache
 /.idea/
