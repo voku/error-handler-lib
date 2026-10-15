@@ -11,7 +11,9 @@ use ReflectionFunction;
 use Throwable;
 
 /**
- * @phpstan-type TraceValue scalar|resource|object|array<array-key, scalar|resource|object|null>|null
+ * @phpstan-type TraceLeaf scalar|resource|object|null
+ * @phpstan-type TraceArrayValue TraceLeaf|array<array-key, TraceLeaf>
+ * @phpstan-type TraceValue TraceLeaf|array<array-key, TraceArrayValue>
  * @phpstan-type TraceFrame array<string, TraceValue>
  * @phpstan-type TraceList list<TraceFrame>
  */
@@ -568,9 +570,10 @@ final class ErrorHandlerLib
         $parts = [];
         $position = 0;
         $hasMoreValues = false;
+        $showAllValues = self::isNamedSqlParameterArray($value);
 
         foreach ($value as $key => $innerValue) {
-            if ($position >= 5) {
+            if (!$showAllValues && $position >= 5) {
                 $hasMoreValues = true;
 
                 break;
@@ -586,6 +589,20 @@ final class ErrorHandlerLib
         }
 
         return $text . ' {' . implode(' | ', $parts) . '} ';
+    }
+
+    /**
+     * @param array<array-key, TraceValue> $value
+     */
+    private static function isNamedSqlParameterArray(array $value): bool
+    {
+        foreach (array_keys($value) as $key) {
+            if (!is_string($key) || !str_starts_with($key, ':')) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static function formatObjectValue(object $value): string

@@ -89,6 +89,21 @@ final class ErrorHandlerLibTest extends TestCase
         );
     }
 
+    public function testGetTypeInfoDoesNotEllipsizeNamedSqlParameters(): void
+    {
+        self::assertSame(
+            "Array(6) {':server' => \"test-server\" | ':company_group' => 10 | ':company' => 831 | ':account' => \"TESTUSER\" | ':display_name' => \"Test User\" | ':level' => 1} ",
+            ErrorHandlerLib::getTypeInfo([
+                ':server'        => 'test-server',
+                ':company_group' => 10,
+                ':company'       => 831,
+                ':account'       => 'TESTUSER',
+                ':display_name'  => 'Test User',
+                ':level'         => 1,
+            ], false)
+        );
+    }
+
     public function testGetTypeInfoFormatsResourceValues(): void
     {
         $resource = fopen('php://memory', 'rb');
@@ -259,6 +274,54 @@ final class ErrorHandlerLibTest extends TestCase
         self::assertStringNotContainsString('Called with params', $message);
         self::assertStringNotContainsString('Called By', $message);
         self::assertDoesNotMatchRegularExpression('/<[^>]+> \"[^\"]+\" on line: <\\d+>/', $message);
+    }
+
+    public function testHandleErrorIncludesAllNamedSqlParametersInStackTrace(): void
+    {
+        $integration = $this->createIntegration(
+            renderCriticalError: static function (string $details, bool $echoOutput): never {
+                throw new RuntimeException($details);
+            }
+        );
+        $handler = new ErrorHandlerLib($integration, new ErrorHandlerNoOpSkipDecider());
+
+        try {
+            $handler->handleError(
+                E_USER_ERROR,
+                'Database query failed',
+                '/tmp/example.php',
+                42,
+                [],
+                [
+                    [
+                        'file'     => '/tmp/Database.php',
+                        'line'     => 123,
+                        'class'    => 'App\\Database',
+                        'type'     => '->',
+                        'function' => 'executeSqlOrThrowException',
+                        'args'     => [
+                            'CALL address_manager(:server, :company_group, :company, :account, :display_name, :level)',
+                            [
+                                ':server'        => 'test-server',
+                                ':company_group' => 10,
+                                ':company'       => 831,
+                                ':account'       => 'TESTUSER',
+                                ':display_name'  => 'Test User',
+                                ':level'         => 1,
+                            ],
+                        ],
+                    ],
+                ]
+            );
+
+            self::fail('Expected critical error rendering to throw.');
+        } catch (RuntimeException $exception) {
+            $message = $exception->getMessage();
+        }
+
+        self::assertStringContainsString("':display_name' => \"Test User\"", $message);
+        self::assertStringContainsString("':level' => 1", $message);
+        self::assertStringNotContainsString("':display_name' => \"Test User\" | ...", $message);
     }
 
     public function testHandleErrorDelegatesCriticalRenderingToIntegration(): void
