@@ -137,6 +137,30 @@ Note that PHPUnit narrows `error_reporting()` to a fatal-only mask while a test 
 PHPUnit almost every diagnostic looks PHP-suppressed. `Observe` is what keeps the handler useful
 there.
 
+### Upgrading existing custom integrations (pre-1.0)
+
+`suppressedDiagnosticPolicy(): SuppressedDiagnosticPolicy` is a required method of
+`ErrorHandlerIntegrationInterface`. Every existing custom implementation **must now implement it**;
+until it does, PHP fails with a fatal error because the class no longer satisfies the interface.
+This is a deliberate pre-1.0 breaking change, and no compatibility shim is provided.
+
+Add `SuppressedDiagnosticPolicy::Observe` to keep the previous behavior: the handler already
+processed PHP-suppressed diagnostics like reported ones, and `Observe` preserves exactly that.
+
+```php
+use voku\ErrorHandlerLib\SuppressedDiagnosticPolicy;
+
+public function suppressedDiagnosticPolicy(): SuppressedDiagnosticPolicy
+{
+    return SuppressedDiagnosticPolicy::Observe;
+}
+```
+
+Choose `LogOnly` or `Ignore` only as a deliberate host-policy decision, not as part of the
+migration: `LogOnly` when suppressed diagnostics should be logged but never rendered (typically
+production), and `Ignore` when PHP's normal suppression semantics should apply again. Both change
+what your application observes compared with before the upgrade.
+
 ### What `SkipDecider` guarantees
 
 A skipped diagnostic produces **no observable processing side effects**: no logging, no debug-bar
