@@ -116,17 +116,26 @@ if ($mode === 'unregister-inner') {
 }
 
 if ($mode === 'recovered-opcache-compile-error') {
-    // opcache_compile_file() catches the compile bailout, warns and returns false. The script
-    // carries on; nothing may be reported as fatal at shutdown.
+    // opcache_compile_file() catches the compile bailout and returns false; PHP up to 8.4 also
+    // raises a "could not compile" warning, which is what used to make the handler keep a copy of
+    // the compile error. The script recovers and clears the last error, so nothing may be reported
+    // as fatal at shutdown.
     $broken = sys_get_temp_dir() . '/error-handler-lib-compile-error-' . getmypid() . '.php';
     file_put_contents($broken, "<?php\nfunction declaredTwice() {}\nfunction declaredTwice() {}\n");
 
     $compiled = @opcache_compile_file($broken);
     unlink($broken);
 
-    if ($compiled === false && str_contains((string) (error_get_last()['message'] ?? ''), 'could not compile')) {
+    $last = error_get_last();
+    if (
+        $compiled === false
+        && is_array($last)
+        && (str_contains($last['message'], 'could not compile') || $last['type'] === E_COMPILE_ERROR)
+    ) {
         echo "OPCACHE-RECOVERED\n";
     }
+
+    error_clear_last();
 
     echo "SCRIPT-FINISHED\n";
 
