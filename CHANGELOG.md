@@ -22,6 +22,57 @@ All notable changes to this project are documented in this file.
   and origin instead of `Throwable::__toString()`, so the raised diagnostic no
   longer contains the throwable's own stack trace.
 
+### Upgrading existing applications (compatibility recipes)
+
+- **Custom integrations:** implement the new method below to retain legacy
+  trace argument rendering. Prefer returning `false` unless the application
+  explicitly needs argument values; returning `true` can expose credentials
+  and personal data and enables exception argument collection during registration.
+  This restores argument rendering, not the old report format.
+
+  ```php
+  public function includeTraceArguments(): bool
+  {
+      return true; // Legacy behavior; prefer false for new integrations.
+  }
+  ```
+
+- **Default integration and skip decider:** if constructor injection previously
+  configured static helpers or subsequently constructed instances, explicitly
+  configure the defaults before registration (with your existing integration
+  and skip decider):
+
+  ```php
+  ErrorHandlerLib::useIntegration($integration, $skipDecider);
+  $handler = (new ErrorHandlerLib())->register();
+  ```
+
+  Pass the existing skip decider when needed; omitting it resets the default
+  skip decider to the no-op implementation.
+
+- **Suppressed diagnostics:** return `SuppressedDiagnosticPolicy::Observe` from
+  `suppressedDiagnosticPolicy()` to retain legacy observation and reporting.
+  Suppressed non-critical diagnostics now return `false` to PHP, so callers
+  may see a new value from `error_get_last()`. There is no compatibility flag
+  for the old return behavior. Critical diagnostics are unaffected.
+- **Explicit Throwable reporting:** `reportError($throwable)` and
+  `reportWarning($throwable)` intentionally omit the throwable's original
+  trace. If an existing consumer requires the old text format, pass an
+  explicitly formatted, redacted string instead. Passing
+  `$throwable->__toString()` would reproduce the old diagnostic text but can
+  expose argument values before library sanitization; do not do so with
+  sensitive data. String inputs and diagnostic severities are unchanged.
+- **Report consumers:** update parsers that read the old `previous_error`
+  context field to consume the new previous-throwables section. There is no
+  legacy-format switch. Review custom sanitizers for the new format and for
+  debug-bar output, which now also passes through the sanitizer.
+- **Handler ownership:** register once per instance and use `unregister()`
+  in reverse registration order when temporarily installing handlers.
+  Applications relying on duplicate registrations or the oldest instance
+  handling shutdown fatals must adjust; those behaviors are not configurable.
+  Set any application-wide INI policy explicitly outside the handler lifecycle
+  rather than relying on registration side effects.
+
 ### Added
 
 - `unregister()` restores the previous error handler (with its type mask), the
