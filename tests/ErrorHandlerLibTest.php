@@ -1105,9 +1105,16 @@ final class ErrorHandlerLibTest extends TestCase
             ini_set('display_startup_errors', '1');
             ini_set('zend.exception_ignore_args', '1');
 
-            $fail = true;
-            $hook = static function () use (&$fail, $throwingHook): bool {
-                if ($fail) {
+            $switch = new class() {
+                public bool $fail = true;
+
+                public function shouldFail(): bool
+                {
+                    return $this->fail;
+                }
+            };
+            $hook = static function () use ($switch, $throwingHook): bool {
+                if ($switch->shouldFail()) {
                     throw new RuntimeException($throwingHook . ' failed');
                 }
 
@@ -1135,7 +1142,7 @@ final class ErrorHandlerLibTest extends TestCase
             self::assertSame('1', (string) ini_get('zend.exception_ignore_args'));
             self::assertPreviousHandlerKeptItsUserNoticeMask();
 
-            $fail = false;
+            $switch->fail = false;
             $handler->register();
             self::assertTrue($handler->isRegistered());
             self::assertNotSame($previousHandler, self::currentErrorHandler());
@@ -1243,10 +1250,11 @@ final class ErrorHandlerLibTest extends TestCase
             restore_error_handler();
         }
 
-        self::assertSame($expectedType, $emitted[0] ?? null);
+        self::assertIsArray($emitted, 'The helper must raise a diagnostic.');
+        self::assertSame($expectedType, $emitted[0]);
         self::assertSame(
             'RuntimeException: ' . $throwable->getMessage() . ' in ' . $throwable->getFile() . ':' . $throwable->getLine(),
-            $emitted[1] ?? null
+            $emitted[1]
         );
 
         // The same diagnostic through the library: log and rendered report.

@@ -105,7 +105,8 @@ if ($mode === 'host-shutdown-overwrites-last-error') {
     });
 }
 
-if ($mode === 'fatal-inside-function' && PHP_VERSION_ID >= 80500) {
+if ($mode === 'fatal-inside-function') {
+    // PHP 8.5+ only; older runtimes do not know the directive and ini_set() just returns false.
     ini_set('fatal_error_backtraces', '1');
 }
 
