@@ -25,6 +25,9 @@ ErrorHandlerLib::reportWarning('Deprecated path used.');
 ErrorHandlerLib::reportError('Unexpected state detected.');
 ```
 
+Both helpers also accept a `Throwable`. It is reported as class, message and origin only, not with
+`Throwable::__toString()`, so its trace cannot carry argument values into the diagnostic.
+
 For application-specific behavior, provide an integration:
 
 ```php
@@ -43,6 +46,52 @@ final class ApplicationErrorIntegration implements ErrorHandlerIntegrationInterf
 ErrorHandlerLib::useIntegration(new ApplicationErrorIntegration());
 (new ErrorHandlerLib())->register();
 ```
+
+`useIntegration()` sets the process-wide default. Passing an integration to the constructor configures
+that one instance only and leaves the defaults alone.
+
+### Registering and unregistering
+
+`register()` is idempotent per instance. `unregister()` reverts it: the previous error handler comes
+back with its original type mask, the previous exception handler comes back, every ini value
+`register()` changed is restored, and the shutdown callback becomes a no-op. Handler stacks are LIFO,
+so if something registered a handler after this one, `unregister()` throws a `LogicException` and
+changes nothing. The check compares the active handler with the closure `register()` installed, so it
+cannot tell when that same closure is installed again further up the stack (for example, a caller
+saves the return value of `set_error_handler()` and installs it again). Don't re-install the
+library's handler closures yourself.
+
+If an integration hook throws during `register()`, nothing has been changed yet, so calling
+`register()` again asks the hooks again. Only ini values that `register()` actually changed are
+restored; a directive that already had the target value is never written, so a value the host sets
+after registration survives `unregister()`.
+
+With nested registrations, a fatal error at shutdown goes to the most recently registered instance,
+the same one whose error handler is active. After `unregister()` the library holds no reference
+to the instance, so a worker can create one handler per job.
+
+```php
+$handler = (new ErrorHandlerLib())->register();
+
+try {
+    // ... run a worker job, a test, an embedded tool ...
+} finally {
+    $handler->unregister();
+}
+```
+
+Unregister in `finally`: a job that throws would otherwise leave its handler installed for the next
+job.
+
+### Stack trace arguments are opt-in
+
+Argument values are the part of a stack trace most likely to carry passwords, tokens and personal
+data, so traces render `App\Auth->login()` rather than `App\Auth->login("admin", "hunter2")` by
+default. An integration opts in with `includeTraceArguments(): bool`. Opting in also makes
+`register()` set `zend.exception_ignore_args=Off`. Without it, the library leaves that setting alone.
+
+`sanitizeErrorDetails()` runs on every channel the library writes to: `error_log()`, rendered
+reports, the coding-agent prompt and debug-bar messages.
 
 ## The error report hands you a prompt
 
@@ -130,8 +179,17 @@ public function suppressedDiagnosticPolicy(): SuppressedDiagnosticPolicy
 | Case | Behavior | Typical host |
 | ---- | -------- | ------------ |
 | `Observe` (default) | suppressed diagnostics are handled like reported ones | development, tests, CI |
-| `LogOnly` | logged and recorded, never rendered into the output | production, or a narrow policy for an external tool run |
+| `LogOnly` | handled like a reported diagnostic of the same type, but never rendered into the output | production, or a narrow policy for an external tool run |
 | `Ignore` | not processed at all; PHP's normal suppression semantics apply | production that wants PHP defaults back |
+
+The policy decides *whether* a suppressed diagnostic is processed, not *how*: notices and
+deprecations are only logged or rendered when `isTestingEnvironment()` is true, whatever the policy.
+
+Whatever the policy, the handler returns `false` for a PHP-suppressed non-critical diagnostic.
+A critical one never returns: it goes to the critical renderer, suppressed or not. PHP's native
+handler then still respects the `@` (nothing is displayed or logged), but records the diagnostic,
+so `error_get_last()` keeps working for code such as
+`if (@fopen($path, 'rb') === false) { $error = error_get_last(); }`.
 
 Note that PHPUnit narrows `error_reporting()` to a fatal-only mask while a test runs, so under
 PHPUnit almost every diagnostic looks PHP-suppressed. `Observe` is what keeps the handler useful
@@ -141,7 +199,8 @@ there.
 
 A skipped diagnostic produces **no observable processing side effects**: no logging, no debug-bar
 entry, no rendering, no counters, no further integration callbacks. `handleError()` returns `true`
-for it, because the host explicitly claimed the diagnostic.
+for it, because the host explicitly claimed the diagnostic. The only exception is a PHP-suppressed
+non-critical diagnostic, which returns `false` so that `error_get_last()` keeps working (see above).
 
 `Ignore` returns `false` instead: the library declines and leaves the diagnostic to PHP.
 
@@ -151,6 +210,24 @@ Critical diagnostics, uncaught exceptions, and shutdown-detected fatal errors ar
 the suppression policy and the skip decider are consulted. Neither can hide them, whatever
 `error_reporting()` says. `tests/Fixture/` proves this end to end against the most hostile host
 policy the API allows.
+
+One limit applies to fatal errors found at shutdown. PHP runs shutdown functions in registration
+order, so one registered before the first `register()` runs before the library. If it raises a
+diagnostic that this handler returns `false` for, PHP replaces the fatal error in `error_get_last()`.
+The handler keeps a copy of the fatal error when that diagnostic reaches it, so the fatal is still
+reported. Nothing is kept if the shutdown function calls `error_clear_last()` before raising the
+diagnostic, installs its own error handler, or runs after the library handler was unregistered.
+Calling `error_clear_last()` after the copy was taken does not discard it.
+
+The copy is only taken for a diagnostic raised from shutdown code: code the engine called, such as a
+shutdown function, rather than code started from a script file. A compile error that the script
+recovered from (`opcache_compile_file()` catches it, warns and returns `false`) leaves a terminating
+error type in `error_get_last()` while the script carries on; it is not replayed at shutdown.
+
+On PHP 8.5+, the report for a fatal error uses the backtrace PHP attaches to `error_get_last()`
+(`fatal_error_backtraces`). Earlier versions provide no trace for fatal errors. PHP discards that
+backtrace as soon as the next diagnostic is raised, before any error handler runs, so in the case
+above the fatal is reported with its message and location but without the backtrace.
 
 ## Development
 

@@ -26,6 +26,19 @@ interface ErrorHandlerIntegrationInterface
 
     public function getGlobalInfo(): string;
 
+    /**
+     * Whether stack traces may render call argument values.
+     *
+     * Argument values are the part of a trace most likely to carry credentials or personal data,
+     * so they are omitted unless the host opts in. Opting in also makes {@see ErrorHandlerLib::register()}
+     * set `zend.exception_ignore_args=Off`, so exception traces carry arguments at all.
+     */
+    public function includeTraceArguments(): bool;
+
+    /**
+     * Last chance to redact a report. Applied to every channel the library writes to: `error_log()`,
+     * rendered reports, the coding-agent prompt and debug-bar messages.
+     */
     public function sanitizeErrorDetails(string $details): string;
 
     public function renderCriticalError(string $details, bool $echoOutput): never;

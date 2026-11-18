@@ -13,9 +13,22 @@ final class ErrorHandlerDefaultIntegration implements ErrorHandlerIntegrationInt
         return $this->shouldDisplayErrors();
     }
 
+    /**
+     * Whether PHP itself displays errors, by PHP's own reading of display_errors
+     * (php-src `php_get_display_errors_mode()`): "stderr", "stdout" and "2" display, " on" with
+     * whitespace does not. A boolean filter gets all four wrong. A numeric mode counts by its low
+     * byte only (php-src keeps it in a uint8_t), so "256" does not display.
+     */
     public function shouldDisplayErrors(): bool
     {
-        return filter_var((string) ini_get('display_errors'), FILTER_VALIDATE_BOOLEAN);
+        $value = (string) ini_get('display_errors');
+        $lower = strtolower($value);
+
+        if (in_array($lower, ['on', 'yes', 'true', 'stdout', 'stderr'], true)) {
+            return true;
+        }
+
+        return (((int) $value) & 0xFF) !== 0;
     }
 
     public function isTestingEnvironment(): bool
@@ -46,6 +59,11 @@ final class ErrorHandlerDefaultIntegration implements ErrorHandlerIntegrationInt
     public function getGlobalInfo(): string
     {
         return '';
+    }
+
+    public function includeTraceArguments(): bool
+    {
+        return false;
     }
 
     public function sanitizeErrorDetails(string $details): string

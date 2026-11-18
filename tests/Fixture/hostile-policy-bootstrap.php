@@ -65,6 +65,11 @@ final class IgnoreSuppressedIntegration implements ErrorHandlerIntegrationInterf
         return $this->default->getGlobalInfo();
     }
 
+    public function includeTraceArguments(): bool
+    {
+        return $this->default->includeTraceArguments();
+    }
+
     public function sanitizeErrorDetails(string $details): string
     {
         return $this->default->sanitizeErrorDetails($details);
