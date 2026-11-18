@@ -100,6 +100,12 @@ All notable changes to this project are documented in this file.
   longer installs a second handler pair.
 - A diagnostic raised while a chained exception's report is being built no
   longer carries that exception's previous-throwable chain.
+- `display_errors` is read the way PHP reads it when deciding whether PHP should
+  display a diagnostic too (`handleError()`'s return value) and in
+  `ErrorHandlerDefaultIntegration::shouldDisplayErrors()`. Previously
+  `display_errors=stderr`, `=stdout` and `=2` counted as off, so the default
+  integration's `register()` switched a stderr setup to `Off`; `" on"` counted
+  as on, so the library rendered errors that PHP itself would not display.
 - Anonymous class names no longer truncate log entries. Their NUL byte made
   `error_log()` drop everything after the name; the library now renders them
   the way PHP does (`class@anonymous`).

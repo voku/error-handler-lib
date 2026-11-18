@@ -1514,16 +1514,19 @@ final class ErrorHandlerLibTest extends TestCase
      */
     public static function provideDisplayDecisions(): iterable
     {
-        yield 'shouldDisplayErrors() true, display_errors was 0' => [true, '0'];
-        yield 'shouldDisplayErrors() true, display_errors was 1' => [true, '1'];
-        yield 'shouldDisplayErrors() false, display_errors was 0' => [false, '0'];
-        yield 'shouldDisplayErrors() false, display_errors was 1' => [false, '1'];
+        foreach ([true, false] as $displayErrors) {
+            foreach (['0', '1', '2', 'stderr', 'stdout', ' on'] as $before) {
+                $name = sprintf('shouldDisplayErrors() %s, display_errors was "%s"', $displayErrors ? 'true' : 'false', $before);
+
+                yield $name => [$displayErrors, $before];
+            }
+        }
     }
 
     /**
      * `true` preserves display_errors (it does not force it on) and turns display_startup_errors on;
      * `false` turns both off. handleError() returns `false` (let PHP display it too) exactly when
-     * display_errors is effectively on at the time of the diagnostic.
+     * PHP itself would display: "2", "stderr" and "stdout" are on, " on" (with whitespace) is off.
      */
     #[\PHPUnit\Framework\Attributes\DataProvider('provideDisplayDecisions')]
     public function testShouldDisplayErrorsDecidesTheIniStateAndTheReturnValue(bool $displayErrors, string $before): void
@@ -1537,9 +1540,11 @@ final class ErrorHandlerLibTest extends TestCase
                 new ErrorHandlerNoOpSkipDecider()
             ))->register();
 
-            $expectDisplayOn = $displayErrors && $before === '1';
-            self::assertSame($expectDisplayOn, filter_var(ini_get('display_errors'), FILTER_VALIDATE_BOOLEAN));
-            self::assertSame($displayErrors, filter_var(ini_get('display_startup_errors'), FILTER_VALIDATE_BOOLEAN));
+            $phpDisplays = !in_array($before, ['0', ' on'], true);
+            $expectDisplayOn = $displayErrors && $phpDisplays;
+            // Already effectively off ("0", " on"): register() leaves the value as it is.
+            self::assertSame($displayErrors || !$phpDisplays ? $before : 'Off', (string) ini_get('display_errors'));
+            self::assertSame($displayErrors ? 'On' : 'Off', (string) ini_get('display_startup_errors'));
 
             $returned = null;
             $this->captureErrorLog(static function () use ($handler, &$returned): void {
@@ -1551,6 +1556,37 @@ final class ErrorHandlerLibTest extends TestCase
             self::assertSame($before, (string) ini_get('display_errors'));
             self::assertSame($displayErrors ? '0' : '1', (string) ini_get('display_startup_errors'));
         });
+    }
+
+    /**
+     * @return iterable<string, array{string, ?string}>
+     */
+    public static function provideNativeDisplayModes(): iterable
+    {
+        yield 'display_errors=stderr' => ['stderr', 'stderr'];
+        yield 'display_errors=2' => ['2', 'stderr'];
+        yield 'display_errors=stdout' => ['stdout', 'stdout'];
+        yield 'display_errors=1' => ['1', 'stdout'];
+        yield 'display_errors=0' => ['0', null];
+        yield 'display_errors=" on"' => [' on', null];
+    }
+
+    /**
+     * End to end with the default integration and PHP's own display: the warning reaches the stream
+     * PHP would use for that display_errors value, and nothing is shown where PHP shows nothing.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('provideNativeDisplayModes')]
+    public function testDefaultIntegrationFollowsPhpsOwnDisplayErrorsMode(string $displayErrors, ?string $expectedStream): void
+    {
+        [$stdout, $stderr] = $this->runFixtureStreams('native-display-delegation.php', [$displayErrors]);
+        $native = 'Warning: native-check in';
+
+        self::assertSame($expectedStream === 'stdout', str_contains($stdout, $native), "PHP's own warning on stdout\n" . $stdout);
+        self::assertSame($expectedStream === 'stderr', str_contains($stderr, $native), "PHP's own warning on stderr\n" . $stderr);
+
+        if ($expectedStream === null) {
+            self::assertStringNotContainsString('native-check', $stdout . $stderr, 'Display is off: the library must not render it either.');
+        }
     }
 
     /**
@@ -2018,6 +2054,30 @@ final class ErrorHandlerLibTest extends TestCase
      *
      * The fatal and shutdown paths cannot be exercised in-process, so they are proven end to end.
      */
+    /**
+     * Runs a fixture to completion and returns stdout and stderr separately.
+     *
+     * @param list<string> $arguments
+     *
+     * @return array{string, string}
+     */
+    private function runFixtureStreams(string $fixtureName, array $arguments = []): array
+    {
+        $fixture = __DIR__ . '/Fixture/' . $fixtureName;
+        self::assertFileExists($fixture);
+
+        $process = proc_open([PHP_BINARY, $fixture, ...$arguments], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        self::assertIsResource($process);
+
+        $stdout = (string) stream_get_contents($pipes[1]);
+        $stderr = (string) stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($process);
+
+        return [$stdout, $stderr];
+    }
+
     /**
      * @param list<string> $arguments
      * @param list<string> $phpOptions e.g. ['-d', 'opcache.enable_cli=1']

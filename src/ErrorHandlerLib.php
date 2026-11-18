@@ -269,7 +269,9 @@ final class ErrorHandlerLib
             return false;
         }
 
-        if (filter_var((string) ini_get('display_errors'), FILTER_VALIDATE_BOOLEAN)) {
+        // Let PHP display it too exactly when PHP itself would: display_errors=stderr or =2 is on,
+        // " on" (with whitespace) is off. See effectiveIniValue().
+        if (self::effectiveIniValue('display_errors', (string) ini_get('display_errors')) !== 'off') {
             return false;
         }
 
