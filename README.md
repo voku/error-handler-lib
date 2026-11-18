@@ -72,9 +72,16 @@ to the instance, so a worker can create one handler per job.
 
 ```php
 $handler = (new ErrorHandlerLib())->register();
-// ... run a worker job, a test, an embedded tool ...
-$handler->unregister();
+
+try {
+    // ... run a worker job, a test, an embedded tool ...
+} finally {
+    $handler->unregister();
+}
 ```
+
+Unregister in `finally`: a job that throws would otherwise leave its handler installed for the next
+job.
 
 ### Stack trace arguments are opt-in
 
@@ -207,12 +214,20 @@ policy the API allows.
 One limit applies to fatal errors found at shutdown. PHP runs shutdown functions in registration
 order, so one registered before the first `register()` runs before the library. If it raises a
 diagnostic that this handler returns `false` for, PHP replaces the fatal error in `error_get_last()`.
-The handler keeps a copy of the fatal error before that happens, so it is still reported. Nothing is
-kept if that shutdown function calls `error_clear_last()`, installs its own error handler, or runs
-after the library handler was unregistered.
+The handler keeps a copy of the fatal error when that diagnostic reaches it, so the fatal is still
+reported. Nothing is kept if the shutdown function calls `error_clear_last()` before raising the
+diagnostic, installs its own error handler, or runs after the library handler was unregistered.
+Calling `error_clear_last()` after the copy was taken does not discard it.
+
+The copy is only taken for a diagnostic raised from shutdown code: code the engine called, such as a
+shutdown function, rather than code started from a script file. A compile error that the script
+recovered from (`opcache_compile_file()` catches it, warns and returns `false`) leaves a terminating
+error type in `error_get_last()` while the script carries on; it is not replayed at shutdown.
 
 On PHP 8.5+, the report for a fatal error uses the backtrace PHP attaches to `error_get_last()`
-(`fatal_error_backtraces`). Earlier versions provide no trace for fatal errors.
+(`fatal_error_backtraces`). Earlier versions provide no trace for fatal errors. PHP discards that
+backtrace as soon as the next diagnostic is raised, before any error handler runs, so in the case
+above the fatal is reported with its message and location but without the backtrace.
 
 ## Development
 

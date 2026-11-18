@@ -105,16 +105,32 @@ if ($mode === 'host-shutdown-overwrites-last-error') {
     });
 }
 
-if ($mode === 'fatal-inside-function') {
-    // PHP 8.5+ only; older runtimes do not know the directive and ini_set() just returns false.
-    ini_set('fatal_error_backtraces', '1');
-}
+// PHP 8.5+ only; older runtimes do not know the directive and ini_set() just returns false.
+ini_set('fatal_error_backtraces', '1');
 
 (new ErrorHandlerLib(new LabelledIntegration('outer')))->register();
 $inner = (new ErrorHandlerLib(new LabelledIntegration('inner')))->register();
 
 if ($mode === 'unregister-inner') {
     $inner->unregister();
+}
+
+if ($mode === 'recovered-opcache-compile-error') {
+    // opcache_compile_file() catches the compile bailout, warns and returns false. The script
+    // carries on; nothing may be reported as fatal at shutdown.
+    $broken = sys_get_temp_dir() . '/error-handler-lib-compile-error-' . getmypid() . '.php';
+    file_put_contents($broken, "<?php\nfunction declaredTwice() {}\nfunction declaredTwice() {}\n");
+
+    $compiled = @opcache_compile_file($broken);
+    unlink($broken);
+
+    if ($compiled === false && str_contains((string) (error_get_last()['message'] ?? ''), 'could not compile')) {
+        echo "OPCACHE-RECOVERED\n";
+    }
+
+    echo "SCRIPT-FINISHED\n";
+
+    return;
 }
 
 final class FixtureClassDeclaredTwice

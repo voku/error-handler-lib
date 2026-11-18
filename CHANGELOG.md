@@ -92,6 +92,17 @@ All notable changes to this project are documented in this file.
   has been changed yet, and `register()` can be retried.
 - `unregister()` restores only ini values that `register()` actually changed;
   a directive that already had the target value is not overwritten later.
+  Values are compared the way PHP parses them (`" on"` is off, `display_errors=2`
+  is stderr).
+- A compile error that the script recovered from (`opcache_compile_file()`) is
+  no longer reported as a fatal error at shutdown.
+- `register()` called from inside an integration hook of the same instance no
+  longer installs a second handler pair.
+- A diagnostic raised while a chained exception's report is being built no
+  longer carries that exception's previous-throwable chain.
+- Anonymous class names no longer truncate log entries. Their NUL byte made
+  `error_log()` drop everything after the name; the library now renders them
+  the way PHP does (`class@anonymous`).
 - Debug-bar messages now pass through `sanitizeErrorDetails()`.
 - Calling `register()` twice no longer stacks a second error handler,
   exception handler or shutdown callback.

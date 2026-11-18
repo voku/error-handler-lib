@@ -93,9 +93,10 @@ final class ErrorHandlerLib
     private array $previousIniValues = [];
 
     /**
-     * The previous-throwable chain of the exception currently being handled, rendered for the report.
+     * Set while register() asks the integration hooks, so a hook that calls register() again on this
+     * instance cannot install a second handler pair.
      */
-    private ?string $currentPreviousChain = null;
+    private bool $registering = false;
 
     /**
      * Constructor arguments configure this instance only. They do not change the process-wide
@@ -164,21 +165,19 @@ final class ErrorHandlerLib
         // Not Throwable::__toString(): that renders argument values whenever the runtime keeps them,
         // bypassing includeTraceArguments(). It gets its own report section rather than a context
         // entry, because context values are truncated to a few hundred characters.
+        // The chain is passed as a value: a diagnostic raised while this report is built (from
+        // getGlobalInfo(), for example) must neither inherit nor clear it.
         $previous = $throwable->getPrevious();
-        $this->currentPreviousChain = $previous instanceof Throwable ? $this->describeThrowableChain($previous) : null;
 
-        try {
-            $this->handleError(
-                E_ERROR,
-                $throwable::class . ': ' . $throwable->getMessage(),
-                $throwable->getFile(),
-                $throwable->getLine(),
-                $context,
-                $backtrace
-            );
-        } finally {
-            $this->currentPreviousChain = null;
-        }
+        $this->handleCriticalDiagnostic(
+            E_ERROR,
+            self::displayClassName($throwable::class) . ': ' . $throwable->getMessage(),
+            $throwable->getFile(),
+            $throwable->getLine(),
+            $context,
+            $backtrace,
+            $previous instanceof Throwable ? $this->describeThrowableChain($previous) : null
+        );
     }
 
     /**
@@ -349,7 +348,8 @@ final class ErrorHandlerLib
      * fatal error before that can happen.
      *
      * Nothing is preserved if this handler is not active at that point, or if a shutdown function
-     * calls `error_clear_last()` or installs its own error handler.
+     * calls `error_clear_last()` before raising the diagnostic or installs its own error handler.
+     * Clearing after the copy was taken does not discard it.
      */
     private static function rememberPendingFatalError(): void
     {
@@ -358,9 +358,42 @@ final class ErrorHandlerLib
         }
 
         $last = error_get_last();
-        if (is_array($last) && ((int) $last['type'] & self::SCRIPT_TERMINATING_ERROR_TYPES) !== 0) {
+        if (
+            is_array($last)
+            && ((int) $last['type'] & self::SCRIPT_TERMINATING_ERROR_TYPES) !== 0
+            && self::isRaisedOutsideTheScriptBody()
+        ) {
             self::$pendingFatalError = $last;
         }
+    }
+
+    /**
+     * A terminating error type can sit in `error_get_last()` without the script having ended:
+     * `opcache_compile_file()` catches a compile bailout, raises a warning and returns `false`.
+     * Keeping that compile error would replay it as a fatal error at shutdown.
+     *
+     * After a real fatal error only shutdown code runs, and a shutdown function is called by the
+     * engine, not from a file: the outermost frame of its call stack has no `file`. Script code,
+     * like the `opcache_compile_file()` call, always starts from a frame in a file.
+     */
+    private static function isRaisedOutsideTheScriptBody(): bool
+    {
+        $frames = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+
+        $handlerFrame = null;
+        foreach ($frames as $index => $frame) {
+            if (($frame['class'] ?? null) === self::class && $frame['function'] === 'handleError') {
+                $handlerFrame = $index;
+            }
+        }
+
+        if ($handlerFrame === null || !isset($frames[$handlerFrame + 1])) {
+            return false;
+        }
+
+        $outermost = $frames[array_key_last($frames)];
+
+        return !isset($outermost['file']);
     }
 
     private function describeThrowableChain(Throwable $throwable): string
@@ -377,7 +410,7 @@ final class ErrorHandlerLib
             }
 
             $output .= ($depth === 0 ? '' : "\n\nNext previous: ")
-                . $current::class . ': ' . $current->getMessage()
+                . self::displayClassName($current::class) . ': ' . $current->getMessage()
                 . ' in ' . $current->getFile() . ':' . $current->getLine()
                 . "\nStack trace:";
 
@@ -477,14 +510,20 @@ final class ErrorHandlerLib
      */
     public function register(): self
     {
-        if ($this->registered) {
+        if ($this->registered || $this->registering) {
             return $this;
         }
 
         // Ask the integration first: if a hook throws, nothing has been changed yet and a retry
-        // asks again.
-        $includeTraceArguments = $this->integration->includeTraceArguments();
-        $displayErrors = $this->integration->shouldDisplayErrors();
+        // asks again. A hook that calls register() on this instance gets a no-op.
+        $this->registering = true;
+
+        try {
+            $includeTraceArguments = $this->integration->includeTraceArguments();
+            $displayErrors = $this->integration->shouldDisplayErrors();
+        } finally {
+            $this->registering = false;
+        }
 
         self::registerShutdownDispatcher();
         $this->registerErrorHandler()
@@ -577,7 +616,7 @@ final class ErrorHandlerLib
     private function setIni(string $directive, string $value): void
     {
         $current = ini_get($directive);
-        if ($current === false || self::iniValuesAreEquivalent($current, $value)) {
+        if ($current === false || self::iniValuesAreEquivalent($directive, $current, $value)) {
             return;
         }
 
@@ -591,20 +630,46 @@ final class ErrorHandlerLib
     }
 
     /**
-     * PHP stores boolean directives in the form they were given ("Off", "0", "", "false" ...), so
-     * compare boolean-looking values by meaning. Anything else (such as `display_errors=stderr`)
-     * must match exactly.
+     * PHP stores a directive in the form it was given ("Off", "0", "", "2", " on" ...), so values
+     * are compared by what PHP makes of them, not by their spelling.
      */
-    private static function iniValuesAreEquivalent(string $current, string $target): bool
+    private static function iniValuesAreEquivalent(string $directive, string $current, string $target): bool
     {
-        $currentBool = filter_var($current, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
-        $targetBool = filter_var($target, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+        return self::effectiveIniValue($directive, $current) === self::effectiveIniValue($directive, $target);
+    }
 
-        if ($currentBool !== null && $targetBool !== null) {
-            return $currentBool === $targetBool;
+    /**
+     * Mirrors php-src: `php_get_display_errors_mode()` for display_errors (off, stdout or stderr) and
+     * `zend_ini_parse_bool()` for the boolean directives - "true"/"yes"/"on" in any case, otherwise
+     * the leading integer, so "2" is on and " on" (with whitespace) is off.
+     */
+    private static function effectiveIniValue(string $directive, string $value): string
+    {
+        $lower = strtolower($value);
+
+        if ($directive === 'display_errors') {
+            if (in_array($lower, ['on', 'yes', 'true', 'stdout'], true)) {
+                return 'stdout';
+            }
+
+            if ($lower === 'stderr') {
+                return 'stderr';
+            }
+
+            $mode = (int) $value;
+
+            return match ($mode) {
+                0 => 'off',
+                2 => 'stderr',
+                default => 'stdout',
+            };
         }
 
-        return $current === $target;
+        if (in_array($lower, ['on', 'yes', 'true'], true)) {
+            return 'on';
+        }
+
+        return (int) $value !== 0 ? 'on' : 'off';
     }
 
     /**
@@ -643,13 +708,14 @@ final class ErrorHandlerLib
         string $errfile,
         int $errline,
         array $context,
-        ?array $backtrace
+        ?array $backtrace,
+        ?string $previousChain = null
     ): never {
         if ($this->integration->isDebugBarRequest()) {
             $this->addDebugBarError($errno, $errstr, $errfile, $errline, $context, $backtrace);
         }
 
-        $details = $this->buildErrorDetails('PHP-ERROR', $errno, $errstr, $errfile, $errline, $context, $backtrace);
+        $details = $this->buildErrorDetails('PHP-ERROR', $errno, $errstr, $errfile, $errline, $context, $backtrace, $previousChain);
 
         // Logs stay machine-shaped; only the report a human is about to read gets the agent prompt.
         error_log($details);
@@ -673,7 +739,7 @@ final class ErrorHandlerLib
             return $error;
         }
 
-        return $error::class . ': ' . $error->getMessage() . ' in ' . $error->getFile() . ':' . $error->getLine();
+        return self::displayClassName($error::class) . ': ' . $error->getMessage() . ' in ' . $error->getFile() . ':' . $error->getLine();
     }
 
     /**
@@ -713,7 +779,8 @@ final class ErrorHandlerLib
         string $errfile,
         int $errline,
         array $context,
-        ?array $backtrace
+        ?array $backtrace,
+        ?string $previousChain = null
     ): string {
         $details = "{$kind} {$errno} occurred in File {$errfile} on Line {$errline}\n\n";
         $details .= match ($kind) {
@@ -725,8 +792,8 @@ final class ErrorHandlerLib
         $details .= $this->integration->getGlobalInfo();
         $details .= $this->backtrace($backtrace);
 
-        if ($this->currentPreviousChain !== null) {
-            $details .= "\nPrevious throwables (outermost first):\n" . $this->currentPreviousChain . "\n";
+        if ($previousChain !== null) {
+            $details .= "\nPrevious throwables (outermost first):\n" . $previousChain . "\n";
         }
 
         if ($context !== []) {
@@ -747,7 +814,7 @@ final class ErrorHandlerLib
                 $type === E_ERROR
                 && self::startsWith(
                     $message,
-                    'Uncaught ' . $this->lastHandledThrowable::class . ': ' . $this->lastHandledThrowable->getMessage()
+                    'Uncaught ' . self::displayClassName($this->lastHandledThrowable::class) . ': ' . $this->lastHandledThrowable->getMessage()
                 )
             ) {
                 return false;
@@ -796,7 +863,7 @@ final class ErrorHandlerLib
         $line = self::stringFrameValue($frame['line'] ?? '');
         $location = $line === '' ? $file : $file . ':' . $line;
 
-        $caller = self::stringFrameValue($frame['class'] ?? '');
+        $caller = self::displayClassName(self::stringFrameValue($frame['class'] ?? ''));
         $caller .= self::stringFrameValue($frame['type'] ?? '');
         $caller .= self::stringFrameValue($frame['function'] ?? '');
         if ($caller === '') {
@@ -923,7 +990,7 @@ final class ErrorHandlerLib
             }
         }
 
-        return $integration->describeObject($value) ?? ('Object(' . $value::class . ')');
+        return $integration->describeObject($value) ?? ('Object(' . self::displayClassName($value::class) . ')');
     }
 
     private function registerExceptionHandler(): self
@@ -986,6 +1053,18 @@ final class ErrorHandlerLib
             || str_contains($upper, 'UPDATE ')
             || str_contains($upper, 'DELETE ')
             || str_contains($upper, 'INSERT ');
+    }
+
+    /**
+     * An anonymous class name is "Parent@anonymous", a NUL byte, then its file and position. PHP
+     * prints only the part before the NUL, and so must the library: error_log() stops writing at a
+     * NUL byte, which silently dropped everything after such a name from the log entry.
+     */
+    private static function displayClassName(string $class): string
+    {
+        $nul = strpos($class, "\0");
+
+        return $nul === false ? $class : substr($class, 0, $nul);
     }
 
     private static function startsWith(string $value, string $prefix): bool

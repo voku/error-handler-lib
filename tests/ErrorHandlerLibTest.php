@@ -217,12 +217,17 @@ final class ErrorHandlerLibTest extends TestCase
         $previous = new RuntimeException('previous failure');
         $throwable = new RuntimeException('current failure', 0, $previous);
 
-        $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessage('RuntimeException: current failure');
-        $this->expectExceptionMessage('Previous throwables (outermost first):');
-        $this->expectExceptionMessage('RuntimeException: previous failure');
+        try {
+            $handler->handleException($throwable);
+            self::fail('Expected critical rendering to throw.');
+        } catch (RuntimeException $exception) {
+            $message = $exception->getMessage();
+        }
 
-        $handler->handleException($throwable);
+        // Three separate assertions: expectExceptionMessage() keeps only the last one.
+        self::assertStringContainsString('RuntimeException: current failure', $message);
+        self::assertStringContainsString('Previous throwables (outermost first):', $message);
+        self::assertStringContainsString('RuntimeException: previous failure', $message);
     }
 
     public function testHandleErrorRendersReadableStackTrace(): void
@@ -957,12 +962,12 @@ final class ErrorHandlerLibTest extends TestCase
 
     public function testRegisterIsIdempotentAndUnregisterRestoresThePreviousHandlerWithItsMask(): void
     {
-        $this->withRestoredHandlerState(function (): void {
+        $this->withRestoredHandlerState(function (Closure $track): void {
             $previousHandler = static fn (): bool => true;
             set_error_handler($previousHandler, E_USER_NOTICE);
             ini_set('display_errors', '1');
 
-            $handler = new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider());
+            $handler = $track(new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()));
             $handler->register();
             $handler->register();
             self::assertTrue($handler->isRegistered());
@@ -978,10 +983,10 @@ final class ErrorHandlerLibTest extends TestCase
 
     public function testRegisterLeavesTraceArgumentsAloneWithoutOptIn(): void
     {
-        $this->withRestoredHandlerState(function (): void {
+        $this->withRestoredHandlerState(function (Closure $track): void {
             ini_set('zend.exception_ignore_args', '1');
 
-            $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+            $handler = $track(new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
             self::assertSame('1', (string) ini_get('zend.exception_ignore_args'));
             $handler->unregister();
         });
@@ -989,8 +994,8 @@ final class ErrorHandlerLibTest extends TestCase
 
     public function testUnregisterRefusesToPopAnErrorHandlerRegisteredAfterIt(): void
     {
-        $this->withRestoredHandlerState(function (): void {
-            $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+        $this->withRestoredHandlerState(function (Closure $track): void {
+            $handler = $track(new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
             $later = static fn (): bool => true;
             set_error_handler($later);
 
@@ -1010,12 +1015,12 @@ final class ErrorHandlerLibTest extends TestCase
 
     public function testUnregisterRestoresThePreviousExceptionHandler(): void
     {
-        $this->withRestoredHandlerState(function (): void {
+        $this->withRestoredHandlerState(function (Closure $track): void {
             $previousExceptionHandler = static function (\Throwable $throwable): void {
             };
             set_exception_handler($previousExceptionHandler);
 
-            $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+            $handler = $track(new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
             self::assertNotSame($previousExceptionHandler, self::currentExceptionHandler());
 
             $handler->unregister();
@@ -1025,8 +1030,8 @@ final class ErrorHandlerLibTest extends TestCase
 
     public function testUnregisterRefusesToPopAnExceptionHandlerRegisteredAfterIt(): void
     {
-        $this->withRestoredHandlerState(function (): void {
-            $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+        $this->withRestoredHandlerState(function (Closure $track): void {
+            $handler = $track(new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
             $libraryErrorHandler = self::currentErrorHandler();
             $later = static function (\Throwable $throwable): void {
             };
@@ -1048,10 +1053,10 @@ final class ErrorHandlerLibTest extends TestCase
 
     public function testOptingIntoTraceArgumentsEnablesExceptionArgumentsUntilUnregistered(): void
     {
-        $this->withRestoredHandlerState(function (): void {
+        $this->withRestoredHandlerState(function (Closure $track): void {
             ini_set('zend.exception_ignore_args', 'On');
 
-            $handler = (new ErrorHandlerLib($this->createIntegration(includeTraceArguments: true), new ErrorHandlerNoOpSkipDecider()))->register();
+            $handler = $track(new ErrorHandlerLib($this->createIntegration(includeTraceArguments: true), new ErrorHandlerNoOpSkipDecider()))->register();
             self::assertFalse(filter_var(ini_get('zend.exception_ignore_args'), FILTER_VALIDATE_BOOLEAN));
 
             $handler->unregister();
@@ -1065,12 +1070,12 @@ final class ErrorHandlerLibTest extends TestCase
      */
     public function testUnregisterKeepsIniChangesTheLibraryDidNotMake(): void
     {
-        $this->withRestoredHandlerState(function (): void {
+        $this->withRestoredHandlerState(function (Closure $track): void {
             ini_set('zend.exception_ignore_args', '0');
             ini_set('display_errors', '0');
             ini_set('display_startup_errors', '0');
 
-            $handler = (new ErrorHandlerLib($this->createIntegration(includeTraceArguments: true), new ErrorHandlerNoOpSkipDecider()))->register();
+            $handler = $track(new ErrorHandlerLib($this->createIntegration(includeTraceArguments: true), new ErrorHandlerNoOpSkipDecider()))->register();
             self::assertSame('0', (string) ini_get('zend.exception_ignore_args'), 'Equivalent values are not rewritten.');
             self::assertSame('0', (string) ini_get('display_errors'));
 
@@ -1095,7 +1100,7 @@ final class ErrorHandlerLibTest extends TestCase
     #[\PHPUnit\Framework\Attributes\DataProvider('provideRegistrationHooks')]
     public function testRegisterChangesNothingWhenAnIntegrationHookThrowsAndCanBeRetried(string $throwingHook): void
     {
-        $this->withRestoredHandlerState(function () use ($throwingHook): void {
+        $this->withRestoredHandlerState(function (Closure $track) use ($throwingHook): void {
             $previousHandler = static fn (): bool => true;
             set_error_handler($previousHandler, E_USER_NOTICE);
             $previousExceptionHandler = static function (\Throwable $throwable): void {
@@ -1120,12 +1125,12 @@ final class ErrorHandlerLibTest extends TestCase
 
                 return true;
             };
-            $handler = new ErrorHandlerLib(
+            $handler = $track(new ErrorHandlerLib(
                 $throwingHook === 'includeTraceArguments'
                     ? $this->createIntegration(includeTraceArgumentsHook: $hook)
                     : $this->createIntegration(shouldDisplayErrors: $hook),
                 new ErrorHandlerNoOpSkipDecider()
-            );
+            ));
 
             try {
                 $handler->register();
@@ -1175,6 +1180,7 @@ final class ErrorHandlerLibTest extends TestCase
     public function testUnregisteredHandlerIsNotRetainedByTheLibrary(): void
     {
         $this->withRestoredHandlerState(function (): void {
+            // Deliberately not tracked: the tracker would hold the reference this test needs gone.
             $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
             $handler->unregister();
             $reference = \WeakReference::create($handler);
@@ -1359,6 +1365,145 @@ final class ErrorHandlerLibTest extends TestCase
         return new RuntimeException('Login failed for a ' . strlen($password) . '-character password');
     }
 
+    /**
+     * opcache_compile_file() catches a compile bailout and returns false; the compile error stays in
+     * error_get_last() although the script goes on. It must not be replayed as a fatal at shutdown.
+     */
+    #[\PHPUnit\Framework\Attributes\RequiresPhpExtension('Zend OPcache')]
+    public function testRecoveredCompileErrorIsNotReportedAsFatalAtShutdown(): void
+    {
+        $output = $this->runFixture('nested-registration-fatal.php', ['recovered-opcache-compile-error'], ['-d', 'opcache.enable_cli=1'], null);
+
+        self::assertStringContainsString('OPCACHE-RECOVERED', $output, 'Precondition: the compile error was raised and recovered.');
+        self::assertStringContainsString('SCRIPT-FINISHED', $output);
+        self::assertStringNotContainsString('HANDLED-BY:', $output);
+    }
+
+    /**
+     * PHP 8.5 clears the fatal-error backtrace as soon as the next diagnostic is raised, before any
+     * error handler runs. The fatal itself is still reported, but without the frames that led to it.
+     */
+    #[\PHPUnit\Framework\Attributes\RequiresPhp('>= 8.5')]
+    public function testFatalErrorBacktraceIsLostWhenAnEarlierShutdownCallbackRaisesADiagnostic(): void
+    {
+        $output = $this->runFixture('nested-registration-fatal.php', ['host-shutdown-overwrites-last-error']);
+
+        self::assertStringContainsString('HANDLED-BY:inner', $output);
+        self::assertStringContainsString('FixtureClassDeclaredTwice', $output);
+        self::assertDoesNotMatchRegularExpression('/^#\d+ .*includeRedeclaringFile\(\)$/m', $output);
+    }
+
+    public function testRegisterCalledFromAnIntegrationHookInstallsOneHandlerPair(): void
+    {
+        $this->withRestoredHandlerState(function (Closure $track): void {
+            $previousHandler = static fn (): bool => true;
+            set_error_handler($previousHandler);
+
+            $handler = null;
+            $handler = $track(new ErrorHandlerLib(
+                $this->createIntegration(includeTraceArgumentsHook: static function () use (&$handler): bool {
+                    $handler?->register();
+
+                    return false;
+                }),
+                new ErrorHandlerNoOpSkipDecider()
+            ));
+            $handler->register();
+            self::assertTrue($handler->isRegistered());
+
+            $handler->unregister();
+            self::assertFalse($handler->isRegistered());
+            self::assertSame($previousHandler, self::currentErrorHandler(), 'A second pair would still be on the stack.');
+        });
+    }
+
+    /**
+     * register() compares by PHP's own parsing rules: " on" is off for a boolean directive, and
+     * display_errors=2 means stderr. Both must be changed, and restored verbatim.
+     */
+    public function testRegisterComparesIniValuesTheWayPhpParsesThem(): void
+    {
+        $this->withRestoredHandlerState(function (Closure $track): void {
+            ini_set('display_startup_errors', ' on');
+
+            $handler = $track(new ErrorHandlerLib(
+                $this->createIntegration(shouldDisplayErrors: static fn (): bool => true),
+                new ErrorHandlerNoOpSkipDecider()
+            ))->register();
+            self::assertSame('On', (string) ini_get('display_startup_errors'), '" on" is off for PHP, so it must be switched on.');
+            $handler->unregister();
+            self::assertSame(' on', (string) ini_get('display_startup_errors'));
+
+            ini_set('display_errors', '2');
+            $handler = $track(new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+            self::assertSame('Off', (string) ini_get('display_errors'), 'display_errors=2 is stderr, not off.');
+            $handler->unregister();
+            self::assertSame('2', (string) ini_get('display_errors'));
+        });
+    }
+
+    /**
+     * An anonymous class name contains a NUL byte, and error_log() stops writing at the first NUL.
+     * A trace frame or object of an anonymous class must not cut off the rest of the log entry.
+     */
+    public function testAnonymousClassNamesDoNotTruncateTheLogEntry(): void
+    {
+        $anonymous = new class() {
+        };
+        self::assertStringContainsString("\0", $anonymous::class, 'Precondition: PHP embeds a NUL byte.');
+
+        $handler = new ErrorHandlerLib($this->createIntegration(includeTraceArguments: true), new ErrorHandlerNoOpSkipDecider());
+        $trace = [['file' => '/app/src/Job.php', 'line' => 8, 'class' => $anonymous::class, 'type' => '->', 'function' => 'run', 'args' => [$anonymous]]];
+
+        $log = $this->captureErrorLog(static function () use ($handler, $trace): void {
+            $handler->handleError(E_USER_WARNING, 'anonymous frame', '/app/src/Job.php', 8, ['after' => 'context-survives'], $trace);
+        }, E_ALL);
+
+        self::assertStringContainsString('class@anonymous->run(Object(class@anonymous))', $log);
+        self::assertStringContainsString('context-survives', $log, 'Everything after the anonymous name must reach the log.');
+        self::assertStringNotContainsString("\0", $log);
+    }
+
+    /**
+     * A diagnostic raised while a chained exception's report is being built (here from
+     * getGlobalInfo()) must not carry the outer exception's causes.
+     */
+    public function testNestedDiagnosticDoesNotInheritThePreviousThrowableChain(): void
+    {
+        $handler = null;
+        $nested = false;
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                getGlobalInfo: static function () use (&$handler, &$nested): string {
+                    if (!$nested) {
+                        $nested = true;
+                        $handler?->handleError(E_USER_WARNING, 'nested from getGlobalInfo', '/app/src/Info.php', 4);
+                    }
+
+                    return '';
+                },
+                renderCriticalError: static function (string $details): never {
+                    throw new RuntimeException($details);
+                }
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $rendered = '';
+        $log = $this->captureErrorLog(static function () use ($handler, &$rendered): void {
+            try {
+                $handler->handleException(new RuntimeException('outer', 0, new RuntimeException('the cause')));
+            } catch (RuntimeException $exception) {
+                $rendered = $exception->getMessage();
+            }
+        }, E_ALL);
+
+        [$nestedEntry] = explode('PHP-ERROR', $log, 2);
+        self::assertStringContainsString('nested from getGlobalInfo', $nestedEntry);
+        self::assertStringNotContainsString('Previous throwables', $nestedEntry);
+        self::assertStringContainsString('RuntimeException: the cause', $rendered, 'The outer report keeps its own chain.');
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Public-interface contract tests. They pin observable behavior through the integration hooks,
     // error_log(), ini values and handleError()'s return value - never private methods.
@@ -1383,11 +1528,11 @@ final class ErrorHandlerLibTest extends TestCase
     #[\PHPUnit\Framework\Attributes\DataProvider('provideDisplayDecisions')]
     public function testShouldDisplayErrorsDecidesTheIniStateAndTheReturnValue(bool $displayErrors, string $before): void
     {
-        $this->withRestoredHandlerState(function () use ($displayErrors, $before): void {
+        $this->withRestoredHandlerState(function (Closure $track) use ($displayErrors, $before): void {
             ini_set('display_errors', $before);
             ini_set('display_startup_errors', $displayErrors ? '0' : '1');
 
-            $handler = (new ErrorHandlerLib(
+            $handler = $track(new ErrorHandlerLib(
                 $this->createIntegration(shouldDisplayErrors: static fn (): bool => $displayErrors),
                 new ErrorHandlerNoOpSkipDecider()
             ))->register();
@@ -1749,11 +1894,22 @@ final class ErrorHandlerLibTest extends TestCase
      * Runs $callback and then restores the error handler stack, the exception handler stack and the
      * ini directives register() may touch, whether or not an assertion inside $callback failed.
      *
-     * Sentinel handlers mark the original top of each stack, so cleanup pops exactly what the test
-     * left behind - including a still-registered library handler.
+     * $callback receives a tracker: pass every ErrorHandlerLib instance through it. Cleanup first
+     * unregisters those (newest first) while their handlers are still on top, so no test instance
+     * stays eligible for the shutdown dispatcher. Sentinel handlers then mark the original top of
+     * each stack, so cleanup pops exactly what the test left behind.
+     *
+     * @param Closure(Closure(ErrorHandlerLib): ErrorHandlerLib): void $callback
      */
     private function withRestoredHandlerState(Closure $callback): void
     {
+        $tracked = [];
+        $track = static function (ErrorHandlerLib $handler) use (&$tracked): ErrorHandlerLib {
+            $tracked[] = $handler;
+
+            return $handler;
+        };
+
         $directives = ['display_errors', 'display_startup_errors', 'zend.exception_ignore_args'];
         $iniValues = [];
         foreach ($directives as $directive) {
@@ -1767,8 +1923,16 @@ final class ErrorHandlerLibTest extends TestCase
         set_exception_handler($exceptionSentinel);
 
         try {
-            $callback();
+            $callback($track);
         } finally {
+            foreach (array_reverse($tracked) as $handler) {
+                try {
+                    $handler->unregister();
+                } catch (\LogicException) {
+                    // Something the test installed sits above it; popped below.
+                }
+            }
+
             for ($i = 0; $i < 20 && self::currentErrorHandler() !== $errorSentinel; $i++) {
                 restore_error_handler();
             }
@@ -1856,14 +2020,16 @@ final class ErrorHandlerLibTest extends TestCase
      */
     /**
      * @param list<string> $arguments
+     * @param list<string> $phpOptions e.g. ['-d', 'opcache.enable_cli=1']
+     * @param null|int     $expectedExitCode null: the exit code is PHP's business, not checked
      */
-    private function runFixture(string $fixtureName, array $arguments = []): string
+    private function runFixture(string $fixtureName, array $arguments = [], array $phpOptions = [], ?int $expectedExitCode = 1): string
     {
         $fixture = __DIR__ . '/Fixture/' . $fixtureName;
         self::assertFileExists($fixture);
 
         $process = proc_open(
-            [PHP_BINARY, $fixture, ...$arguments],
+            [PHP_BINARY, ...$phpOptions, $fixture, ...$arguments],
             [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
             $pipes
         );
@@ -1874,7 +2040,10 @@ final class ErrorHandlerLibTest extends TestCase
         fclose($pipes[1]);
         fclose($pipes[2]);
 
-        self::assertSame(1, proc_close($process), 'The fixture must exit through renderCriticalError().');
+        $exitCode = proc_close($process);
+        if ($expectedExitCode !== null) {
+            self::assertSame($expectedExitCode, $exitCode, 'The fixture must exit through renderCriticalError().');
+        }
 
         return $stdout . $stderr;
     }
