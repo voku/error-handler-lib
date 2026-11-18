@@ -55,6 +55,10 @@ back with its original type mask, the previous exception handler comes back, eve
 so if something registered a handler after this one, `unregister()` throws a `LogicException` and
 changes nothing.
 
+With nested registrations, a fatal error at shutdown goes to the most recently registered instance,
+the same one whose error handler is active. After `unregister()` the library holds no reference
+to the instance, so a worker can create one handler per job.
+
 ```php
 $handler = (new ErrorHandlerLib())->register();
 // ... run a worker job, a test, an embedded tool ...

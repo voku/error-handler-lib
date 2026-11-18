@@ -36,6 +36,22 @@ final class ErrorHandlerLib
 
     private static ?ErrorHandlerSkipDeciderInterface $defaultSkipDecider = null;
 
+    private const int MAX_PREVIOUS_THROWABLES = 10;
+
+    /**
+     * Registered instances in registration order, keyed by object id.
+     *
+     * PHP runs shutdown functions in registration order and cannot remove one, so the library
+     * registers a single dispatcher per process. It hands a fatal error to the most recently
+     * registered instance only - the one whose error handler is active - and holds no reference to
+     * an instance after {@see unregister()}, so per-job handlers in a worker can be collected.
+     *
+     * @var array<int, self>
+     */
+    private static array $registeredInstances = [];
+
+    private static bool $shutdownDispatcherRegistered = false;
+
     private readonly int $fatalErrorTypes;
 
     private readonly ErrorHandlerIntegrationInterface $integration;
@@ -52,8 +68,6 @@ final class ErrorHandlerLib
 
     private bool $registered = false;
 
-    private bool $shutdownFunctionRegistered = false;
-
     private ?Closure $registeredErrorHandler = null;
 
     private ?Closure $registeredExceptionHandler = null;
@@ -64,6 +78,11 @@ final class ErrorHandlerLib
      * @var array<string, string|false>
      */
     private array $previousIniValues = [];
+
+    /**
+     * The previous-throwable chain of the exception currently being handled, rendered for the report.
+     */
+    private ?string $currentPreviousChain = null;
 
     /**
      * Constructor arguments configure this instance only. They do not change the process-wide
@@ -129,19 +148,24 @@ final class ErrorHandlerLib
     {
         $this->lastHandledThrowable = $throwable;
 
+        // Not Throwable::__toString(): that renders argument values whenever the runtime keeps them,
+        // bypassing includeTraceArguments(). It gets its own report section rather than a context
+        // entry, because context values are truncated to a few hundred characters.
         $previous = $throwable->getPrevious();
-        if ($previous instanceof Throwable) {
-            $context['previous_error'] = ($context['previous_error'] ?? '') . $previous->__toString();
-        }
+        $this->currentPreviousChain = $previous instanceof Throwable ? $this->describeThrowableChain($previous) : null;
 
-        $this->handleError(
-            E_ERROR,
-            $throwable::class . ': ' . $throwable->getMessage(),
-            $throwable->getFile(),
-            $throwable->getLine(),
-            $context,
-            $backtrace
-        );
+        try {
+            $this->handleError(
+                E_ERROR,
+                $throwable::class . ': ' . $throwable->getMessage(),
+                $throwable->getFile(),
+                $throwable->getLine(),
+                $context,
+                $backtrace
+            );
+        } finally {
+            $this->currentPreviousChain = null;
+        }
     }
 
     /**
@@ -295,6 +319,36 @@ final class ErrorHandlerLib
         $this->handleThrowable($exception, [], self::fatalErrorTrace($error) ?? $exception->getTrace());
     }
 
+    private function describeThrowableChain(Throwable $throwable): string
+    {
+        $showArgs = $this->integration->includeTraceArguments();
+        $output = '';
+        $depth = 0;
+
+        for ($current = $throwable; $current instanceof Throwable; $current = $current->getPrevious()) {
+            if ($depth >= self::MAX_PREVIOUS_THROWABLES) {
+                $output .= "\n\n... (deeper previous throwables omitted)";
+
+                break;
+            }
+
+            $output .= ($depth === 0 ? '' : "\n\nNext previous: ")
+                . $current::class . ': ' . $current->getMessage()
+                . ' in ' . $current->getFile() . ':' . $current->getLine()
+                . "\nStack trace:";
+
+            /** @var TraceList $trace */
+            $trace = $current->getTrace();
+            foreach ($trace as $frameNumber => $frame) {
+                $output .= "\n" . $this->formatTraceFrame($frame, $frameNumber, $showArgs);
+            }
+
+            $depth++;
+        }
+
+        return $output;
+    }
+
     /**
      * PHP 8.5+ can attach the backtrace of a fatal error to `error_get_last()` (`fatal_error_backtraces`).
      * Earlier versions have no such key; the shutdown-time trace is then the only one available.
@@ -383,11 +437,12 @@ final class ErrorHandlerLib
             return $this;
         }
 
-        $this->registerShutdownFunction()
-            ->registerErrorHandler()
+        self::registerShutdownDispatcher();
+        $this->registerErrorHandler()
             ->registerExceptionHandler();
 
         $this->registered = true;
+        self::$registeredInstances[spl_object_id($this)] = $this;
 
         if ($this->integration->includeTraceArguments()) {
             $this->setIni('zend.exception_ignore_args', 'Off');
@@ -407,8 +462,8 @@ final class ErrorHandlerLib
 
     /**
      * Reverts {@see register()}: restores the previous error and exception handlers (including the
-     * error handler's original type mask), restores every ini value `register()` changed, and turns
-     * the shutdown callback into a no-op (PHP cannot remove a shutdown function).
+     * error handler's original type mask), restores every ini value `register()` changed, and stops
+     * this instance from receiving fatal errors at shutdown. The library keeps no reference to it.
      *
      * Handler stacks are LIFO. If another error or exception handler was installed after this one,
      * nothing is changed and a {@see LogicException} is thrown: popping the stack would remove the
@@ -445,6 +500,7 @@ final class ErrorHandlerLib
             }
         }
 
+        unset(self::$registeredInstances[spl_object_id($this)]);
         $this->previousIniValues = [];
         $this->registeredErrorHandler = null;
         $this->registeredExceptionHandler = null;
@@ -575,6 +631,10 @@ final class ErrorHandlerLib
         $details .= $errstr . "\n";
         $details .= $this->integration->getGlobalInfo();
         $details .= $this->backtrace($backtrace);
+
+        if ($this->currentPreviousChain !== null) {
+            $details .= "\nPrevious throwables (outermost first):\n" . $this->currentPreviousChain . "\n";
+        }
 
         if ($context !== []) {
             $details .= "\n" . $this->formatContext($context);
@@ -790,23 +850,21 @@ final class ErrorHandlerLib
     }
 
     /**
-     * PHP offers no way to remove a shutdown function, so it is registered once per instance and
-     * only acts while the instance is registered.
+     * See {@see $registeredInstances}. The dispatcher is static so it never captures an instance.
      */
-    private function registerShutdownFunction(): self
+    private static function registerShutdownDispatcher(): void
     {
-        if (!$this->shutdownFunctionRegistered) {
-            register_shutdown_function(function (): void {
-                if ($this->registered) {
-                    $this->handleFatalError();
+        if (!self::$shutdownDispatcherRegistered) {
+            register_shutdown_function(static function (): void {
+                $active = array_key_last(self::$registeredInstances);
+                if ($active !== null) {
+                    self::$registeredInstances[$active]->handleFatalError();
                 }
             });
-            $this->shutdownFunctionRegistered = true;
+            self::$shutdownDispatcherRegistered = true;
         }
 
         self::$reservedMemory = str_repeat('x', self::RESERVED_MEMORY_SIZE);
-
-        return $this;
     }
 
     private static function getDefaultIntegration(): ErrorHandlerIntegrationInterface

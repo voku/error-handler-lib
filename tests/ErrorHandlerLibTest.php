@@ -218,7 +218,7 @@ final class ErrorHandlerLibTest extends TestCase
 
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('RuntimeException: current failure');
-        $this->expectExceptionMessage('previous_error');
+        $this->expectExceptionMessage('Previous throwables (outermost first):');
         $this->expectExceptionMessage('RuntimeException: previous failure');
 
         $handler->handleException($throwable);
@@ -1027,6 +1027,106 @@ final class ErrorHandlerLibTest extends TestCase
         }
     }
 
+    public function testShutdownFatalErrorGoesToTheActiveNestedRegistration(): void
+    {
+        $output = $this->runFixture('nested-registration-fatal.php');
+
+        self::assertStringContainsString('HANDLED-BY:inner', $output);
+        self::assertStringNotContainsString('HANDLED-BY:outer', $output);
+        self::assertStringContainsString('FixtureClassDeclaredTwice', $output);
+    }
+
+    public function testShutdownFatalErrorGoesToTheOuterRegistrationOnceTheInnerIsUnregistered(): void
+    {
+        $output = $this->runFixture('nested-registration-fatal.php', ['unregister-inner']);
+
+        self::assertStringContainsString('HANDLED-BY:outer', $output);
+        self::assertStringNotContainsString('HANDLED-BY:inner', $output);
+    }
+
+    public function testUnregisteredHandlerIsNotRetainedByTheLibrary(): void
+    {
+        $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+        $handler->unregister();
+        $reference = \WeakReference::create($handler);
+        unset($handler);
+        gc_collect_cycles();
+
+        self::assertNull($reference->get(), 'A worker that creates one handler per job must not accumulate them.');
+    }
+
+    public function testPreviousExceptionChainOmitsArgumentValuesByDefault(): void
+    {
+        $previousIgnoreArgs = (string) ini_get('zend.exception_ignore_args');
+        $previousMaxLength = (string) ini_get('zend.exception_string_param_max_len');
+        ini_set('zend.exception_ignore_args', '0');
+        ini_set('zend.exception_string_param_max_len', '100');
+
+        try {
+            $previous = self::createExceptionWithArgument('SECRET_42');
+            $throwable = new RuntimeException('current failure', 0, new RuntimeException('middle', 0, $previous));
+            $phpRendering = $previous->__toString();
+        } finally {
+            ini_set('zend.exception_ignore_args', $previousIgnoreArgs);
+            ini_set('zend.exception_string_param_max_len', $previousMaxLength);
+        }
+
+        self::assertStringContainsString('SECRET_42', $phpRendering, 'Precondition: PHP itself would leak the argument.');
+
+        $rendered = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                renderCriticalError: static function (string $details) use (&$rendered): never {
+                    $rendered[] = $details;
+
+                    throw new RuntimeException('rendered');
+                },
+                shouldEchoOutput: static fn (): bool => true
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $log = $this->captureErrorLog(static function () use ($handler, $throwable): void {
+            try {
+                $handler->handleException($throwable);
+            } catch (RuntimeException) {
+            }
+        });
+
+        self::assertCount(1, $rendered);
+        self::assertStringContainsString('RuntimeException: middle', $rendered[0]);
+        self::assertStringContainsString('createExceptionWithArgument', $log . $rendered[0]);
+        self::assertStringNotContainsString('SECRET_42', $rendered[0], 'Neither the report nor the agent prompt may carry it.');
+        self::assertStringNotContainsString('SECRET_42', $log);
+    }
+
+    public function testPreviousExceptionChainShowsArgumentValuesWhenOptedIn(): void
+    {
+        $previousIgnoreArgs = (string) ini_get('zend.exception_ignore_args');
+        $previousMaxLength = (string) ini_get('zend.exception_string_param_max_len');
+        ini_set('zend.exception_ignore_args', '0');
+        ini_set('zend.exception_string_param_max_len', '100');
+
+        try {
+            $throwable = new RuntimeException('current failure', 0, self::createExceptionWithArgument('visible-arg'));
+        } finally {
+            ini_set('zend.exception_ignore_args', $previousIgnoreArgs);
+            ini_set('zend.exception_string_param_max_len', $previousMaxLength);
+        }
+
+        $handler = new ErrorHandlerLib($this->createIntegration(includeTraceArguments: true), new ErrorHandlerNoOpSkipDecider());
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('createExceptionWithArgument("visible-arg")');
+
+        $handler->handleException($throwable);
+    }
+
+    private static function createExceptionWithArgument(string $password): RuntimeException
+    {
+        return new RuntimeException('Login failed for a ' . strlen($password) . '-character password');
+    }
+
     /**
      * @template T
      *
@@ -1050,13 +1150,16 @@ final class ErrorHandlerLibTest extends TestCase
      *
      * The fatal and shutdown paths cannot be exercised in-process, so they are proven end to end.
      */
-    private function runFixture(string $fixtureName): string
+    /**
+     * @param list<string> $arguments
+     */
+    private function runFixture(string $fixtureName, array $arguments = []): string
     {
         $fixture = __DIR__ . '/Fixture/' . $fixtureName;
         self::assertFileExists($fixture);
 
         $process = proc_open(
-            [PHP_BINARY, $fixture],
+            [PHP_BINARY, $fixture, ...$arguments],
             [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
             $pipes
         );

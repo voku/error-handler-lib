@@ -14,6 +14,10 @@ All notable changes to this project are documented in this file.
   process-wide defaults. Call `ErrorHandlerLib::useIntegration()` explicitly
   if static helpers such as `getTypeInfo()` or `getGlobalJavaScriptErrorHandler()`
   should use that integration.
+- The previous-exception chain is no longer a `previous_error` context entry
+  (which was truncated to 256 characters). It is a separate
+  `Previous throwables (outermost first):` section in the report, formatted
+  by the library so it honours `includeTraceArguments()`.
 
 ### Added
 
@@ -30,6 +34,12 @@ All notable changes to this project are documented in this file.
 - Debug-bar messages now pass through `sanitizeErrorDetails()`.
 - Calling `register()` twice no longer stacks a second error handler,
   exception handler or shutdown callback.
+- Chained exceptions no longer leak argument values through
+  `Throwable::__toString()` when `includeTraceArguments()` is `false`.
+- With nested registrations, a shutdown-time fatal error now goes to the most
+  recently registered (active) instance instead of the first one.
+- A single static shutdown dispatcher replaces per-instance shutdown callbacks,
+  so an unregistered handler is no longer retained until process exit.
 
 ### Documentation
 
