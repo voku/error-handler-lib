@@ -1359,6 +1359,392 @@ final class ErrorHandlerLibTest extends TestCase
         return new RuntimeException('Login failed for a ' . strlen($password) . '-character password');
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Public-interface contract tests. They pin observable behavior through the integration hooks,
+    // error_log(), ini values and handleError()'s return value - never private methods.
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * @return iterable<string, array{bool, string}>
+     */
+    public static function provideDisplayDecisions(): iterable
+    {
+        yield 'shouldDisplayErrors() true, display_errors was 0' => [true, '0'];
+        yield 'shouldDisplayErrors() true, display_errors was 1' => [true, '1'];
+        yield 'shouldDisplayErrors() false, display_errors was 0' => [false, '0'];
+        yield 'shouldDisplayErrors() false, display_errors was 1' => [false, '1'];
+    }
+
+    /**
+     * `true` preserves display_errors (it does not force it on) and turns display_startup_errors on;
+     * `false` turns both off. handleError() returns `false` (let PHP display it too) exactly when
+     * display_errors is effectively on at the time of the diagnostic.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('provideDisplayDecisions')]
+    public function testShouldDisplayErrorsDecidesTheIniStateAndTheReturnValue(bool $displayErrors, string $before): void
+    {
+        $this->withRestoredHandlerState(function () use ($displayErrors, $before): void {
+            ini_set('display_errors', $before);
+            ini_set('display_startup_errors', $displayErrors ? '0' : '1');
+
+            $handler = (new ErrorHandlerLib(
+                $this->createIntegration(shouldDisplayErrors: static fn (): bool => $displayErrors),
+                new ErrorHandlerNoOpSkipDecider()
+            ))->register();
+
+            $expectDisplayOn = $displayErrors && $before === '1';
+            self::assertSame($expectDisplayOn, filter_var(ini_get('display_errors'), FILTER_VALIDATE_BOOLEAN));
+            self::assertSame($displayErrors, filter_var(ini_get('display_startup_errors'), FILTER_VALIDATE_BOOLEAN));
+
+            $returned = null;
+            $this->captureErrorLog(static function () use ($handler, &$returned): void {
+                $returned = $handler->handleError(E_USER_WARNING, 'display decision', '/app/src/A.php', 3);
+            }, E_ALL);
+            self::assertSame(!$expectDisplayOn, $returned);
+
+            $handler->unregister();
+            self::assertSame($before, (string) ini_get('display_errors'));
+            self::assertSame($displayErrors ? '0' : '1', (string) ini_get('display_startup_errors'));
+        });
+    }
+
+    /**
+     * @return iterable<string, array{?SuppressedDiagnosticPolicy, int, bool}>
+     */
+    public static function provideDiagnosticMatrix(): iterable
+    {
+        $policies = [
+            'Observe' => SuppressedDiagnosticPolicy::Observe,
+            'LogOnly' => SuppressedDiagnosticPolicy::LogOnly,
+            'Ignore' => SuppressedDiagnosticPolicy::Ignore,
+            'not suppressed' => null,
+        ];
+        $types = ['warning' => E_USER_WARNING, 'notice' => E_USER_NOTICE, 'deprecation' => E_USER_DEPRECATED];
+
+        foreach ($policies as $policyName => $policy) {
+            foreach ($types as $typeName => $type) {
+                foreach (['testing' => true, 'non-testing' => false] as $environmentName => $testing) {
+                    yield "{$policyName}, {$typeName}, {$environmentName}" => [$policy, $type, $testing];
+                }
+            }
+        }
+    }
+
+    /**
+     * $policy null means the diagnostic is not PHP-suppressed (controls; the policy is irrelevant).
+     * Suppression uses an explicit mask that excludes exactly this type.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('provideDiagnosticMatrix')]
+    public function testDiagnosticMatrixAcrossPolicyTypeAndEnvironment(?SuppressedDiagnosticPolicy $policy, int $errno, bool $testing): void
+    {
+        $rendered = [];
+        $debugBar = [];
+        $skipCalls = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                shouldEchoOutput: static fn (): bool => true,
+                isTestingEnvironment: static fn (): bool => $testing,
+                isDebugBarRequest: static fn (): bool => true,
+                addDebugBarMessage: static function (int $type, string $description) use (&$debugBar): void {
+                    $debugBar[] = $type;
+                },
+                renderNonCriticalError: static function (string $label, string $details, bool $echoOutput) use (&$rendered): void {
+                    $rendered[] = [$label, $echoOutput];
+                },
+                suppressedDiagnosticPolicy: $policy ?? SuppressedDiagnosticPolicy::Ignore
+            ),
+            self::skipDecider(static function (int $errno, string $errstr, string $errfile, int $errline) use (&$skipCalls): bool {
+                $skipCalls[] = [$errno, $errstr, $errfile, $errline];
+
+                return false;
+            })
+        );
+
+        $previousDisplayErrors = (string) ini_get('display_errors');
+        ini_set('display_errors', '0');
+        $returned = null;
+
+        try {
+            $log = $this->captureErrorLog(static function () use ($handler, $errno, &$returned): void {
+                $returned = $handler->handleError($errno, 'matrix event', '/app/src/Matrix.php', 7);
+            }, $policy === null ? E_ALL : E_ALL & ~$errno);
+        } finally {
+            ini_set('display_errors', $previousDisplayErrors);
+        }
+
+        $processed = $policy !== SuppressedDiagnosticPolicy::Ignore;
+        $reportable = $processed && ($errno === E_USER_WARNING || $testing);
+        $renderable = $reportable && $policy !== SuppressedDiagnosticPolicy::LogOnly;
+
+        self::assertSame($policy === null, $returned, 'Suppressed: always false. Reported, display_errors off: true.');
+        self::assertSame($processed ? [[$errno, 'matrix event', '/app/src/Matrix.php', 7]] : [], $skipCalls);
+        self::assertSame($processed ? [$errno] : [], $debugBar, 'The debug bar records every processed diagnostic.');
+        self::assertSame($reportable, str_contains($log, 'matrix event'), 'Notices and deprecations are logged in testing only.');
+        self::assertSame($renderable ? [[$errno === E_USER_WARNING ? 'Warning' : 'Notice', true]] : [], $rendered);
+    }
+
+    /**
+     * @return iterable<string, array{bool, string}>
+     */
+    public static function provideEchoDecisions(): iterable
+    {
+        yield 'echo on, display_errors off' => [true, '0'];
+        yield 'echo off, display_errors on' => [false, '1'];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('provideEchoDecisions')]
+    public function testShouldEchoOutputDecidesRenderingIndependentlyOfDisplayErrors(bool $echo, string $displayErrors): void
+    {
+        $rendered = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                shouldEchoOutput: static fn (): bool => $echo,
+                renderNonCriticalError: static function (string $label, string $details, bool $echoOutput) use (&$rendered): void {
+                    $rendered[] = [$details, $echoOutput];
+                }
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $previousDisplayErrors = (string) ini_get('display_errors');
+        ini_set('display_errors', $displayErrors);
+
+        try {
+            $log = $this->captureErrorLog(static function () use ($handler): void {
+                $handler->handleError(E_USER_WARNING, 'echo decision', '/app/src/Echo.php', 5);
+            }, E_ALL);
+        } finally {
+            ini_set('display_errors', $previousDisplayErrors);
+        }
+
+        self::assertStringContainsString('echo decision', $log, 'Logging never depends on echo.');
+        self::assertStringNotContainsString('COPY EVERYTHING BELOW INTO A CODING AGENT', $log);
+
+        if (!$echo) {
+            self::assertSame([], $rendered);
+
+            return;
+        }
+
+        self::assertCount(1, $rendered);
+        self::assertTrue($rendered[0][1]);
+        self::assertStringContainsString('COPY EVERYTHING BELOW INTO A CODING AGENT', $rendered[0][0]);
+    }
+
+    /**
+     * @return iterable<string, array{bool}>
+     */
+    public static function provideEchoFlags(): iterable
+    {
+        yield 'echo on' => [true];
+        yield 'echo off' => [false];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('provideEchoFlags')]
+    public function testCriticalRendererReceivesTheEchoFlagAndThePromptOnlyWhenEchoing(bool $echo): void
+    {
+        $received = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                renderCriticalError: static function (string $details, bool $echoOutput) use (&$received): never {
+                    $received[] = [$details, $echoOutput];
+
+                    throw new RuntimeException('rendered');
+                },
+                shouldEchoOutput: static fn (): bool => $echo
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $log = $this->captureErrorLog(static function () use ($handler): void {
+            try {
+                $handler->handleError(E_USER_ERROR, 'critical echo', '/app/src/Crit.php', 9);
+            } catch (RuntimeException) {
+            }
+        }, E_ALL);
+
+        self::assertCount(1, $received);
+        self::assertSame($echo, $received[0][1]);
+        self::assertSame($echo, str_contains($received[0][0], 'COPY EVERYTHING BELOW INTO A CODING AGENT'));
+        self::assertStringContainsString('critical echo', $log);
+        self::assertStringNotContainsString('COPY EVERYTHING BELOW INTO A CODING AGENT', $log);
+    }
+
+    /**
+     * useIntegration() sets the process defaults: static helpers and argument-less instances use
+     * them. A constructor argument overrides the integration for that instance only; an instance
+     * built without a skip decider still takes the default one.
+     */
+    public function testUseIntegrationDefaultsAndConstructorOverride(): void
+    {
+        $defaultLog = [];
+        $overrideLog = [];
+        $skipCalls = [];
+        $decider = self::skipDecider(static function (int $errno, string $errstr, string $errfile, int $errline) use (&$skipCalls): bool {
+            $skipCalls[] = [$errno, $errstr, $errfile, $errline];
+
+            return $errstr === 'skip me';
+        });
+
+        ErrorHandlerLib::useIntegration(
+            $this->createIntegration(
+                describeObject: static fn (object $value): string => 'DefaultDescribed',
+                renderJavaScriptErrorHandler: static fn (): string => '<script>default</script>',
+                shouldEchoOutput: static fn (): bool => true,
+                renderNonCriticalError: static function (string $label, string $details) use (&$defaultLog): void {
+                    $defaultLog[] = $details;
+                }
+            ),
+            $decider
+        );
+
+        self::assertSame('DefaultDescribed', ErrorHandlerLib::getTypeInfo(new stdClass(), false));
+        self::assertSame('<script>default</script>', ErrorHandlerLib::getGlobalJavaScriptErrorHandler());
+
+        $defaultHandler = new ErrorHandlerLib();
+        $overrideHandler = new ErrorHandlerLib($this->createIntegration(
+            shouldEchoOutput: static fn (): bool => true,
+            renderNonCriticalError: static function (string $label, string $details) use (&$overrideLog): void {
+                $overrideLog[] = $details;
+            }
+        ));
+
+        $this->captureErrorLog(static function () use ($defaultHandler, $overrideHandler): void {
+            $defaultHandler->handleError(E_USER_WARNING, 'skip me', '/app/src/Skip.php', 10);
+            $defaultHandler->handleError(E_USER_WARNING, 'keep me', '/app/src/Skip.php', 11);
+            $overrideHandler->handleError(E_USER_WARNING, 'override keeps me', '/app/src/Other.php', 12);
+        }, E_ALL);
+
+        self::assertSame(
+            [
+                [E_USER_WARNING, 'skip me', '/app/src/Skip.php', 10],
+                [E_USER_WARNING, 'keep me', '/app/src/Skip.php', 11],
+                [E_USER_WARNING, 'override keeps me', '/app/src/Other.php', 12],
+            ],
+            $skipCalls,
+            'The decider gets the exact diagnostic; the override instance still uses the default decider.'
+        );
+        self::assertCount(1, $defaultLog);
+        self::assertStringContainsString('keep me', $defaultLog[0]);
+        self::assertCount(1, $overrideLog);
+        self::assertStringContainsString('override keeps me', $overrideLog[0]);
+
+        self::assertSame('DefaultDescribed', ErrorHandlerLib::getTypeInfo(new stdClass(), false), 'The override does not leak into statics.');
+    }
+
+    /**
+     * getGlobalInfo(), describeObject() and sanitizeErrorDetails() compose on every channel. The
+     * secret is planted in the message, the context, a trace argument, the object description and
+     * the global info; only the sanitized form may leave the library.
+     */
+    public function testIntegrationHooksComposeAcrossLogRendererDebugBarAndPrompt(): void
+    {
+        $rendered = [];
+        $debugBar = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                describeObject: static fn (object $value): string => 'Described(token=hunter2)',
+                getGlobalInfo: static fn (): string => "GLOBAL-INFO request=hunter2\n",
+                sanitizeErrorDetails: static fn (string $details): string => str_replace('hunter2', '[REDACTED]', $details),
+                shouldEchoOutput: static fn (): bool => true,
+                isDebugBarRequest: static fn (): bool => true,
+                addDebugBarMessage: static function (int $errno, string $description) use (&$debugBar): void {
+                    $debugBar[] = $description;
+                },
+                renderNonCriticalError: static function (string $label, string $details) use (&$rendered): void {
+                    $rendered[] = $details;
+                },
+                includeTraceArguments: true
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+        $trace = [['file' => '/app/src/Auth.php', 'line' => 21, 'class' => 'App\\Auth', 'type' => '->', 'function' => 'login', 'args' => [new stdClass(), 'hunter2']]];
+
+        $log = $this->captureErrorLog(static function () use ($handler, $trace): void {
+            $handler->handleError(E_USER_WARNING, 'login hunter2 failed', '/app/src/Auth.php', 21, ['token' => 'hunter2'], $trace);
+        }, E_ALL);
+
+        self::assertCount(1, $rendered);
+        self::assertCount(1, $debugBar);
+        [$report, $prompt] = explode('----- COPY EVERYTHING BELOW INTO A CODING AGENT -----', $rendered[0], 2);
+
+        foreach (['log' => $log, 'report' => $report] as $channel => $output) {
+            self::assertStringContainsString('GLOBAL-INFO request=[REDACTED]', $output, $channel);
+            self::assertStringContainsString('App\\Auth->login(Described(token=[REDACTED]), "[REDACTED]")', $output, $channel);
+            self::assertStringContainsString("[token] => \"[REDACTED]\"", $output, $channel);
+        }
+
+        self::assertStringContainsString('App\\Auth->login(Described(token=[REDACTED]), "[REDACTED]")', $debugBar[0]);
+        self::assertStringNotContainsString('GLOBAL-INFO', $debugBar[0], 'The debug bar carries no global info.');
+
+        self::assertStringContainsString('App\\Auth->login()', $prompt, 'The prompt never renders arguments, even when opted in.');
+        self::assertStringNotContainsString('Described(', $prompt);
+        self::assertStringContainsString('token: "[REDACTED]"', $prompt);
+        self::assertStringNotContainsString('GLOBAL-INFO', $prompt);
+
+        foreach (['log' => $log, 'rendered' => $rendered[0], 'debug bar' => $debugBar[0]] as $channel => $output) {
+            self::assertStringNotContainsString('hunter2', $output, $channel);
+        }
+    }
+
+    /**
+     * Rendering is capped at two warnings and two notices per instance; logging is not capped, and
+     * each instance has its own counters.
+     */
+    public function testRenderCapsArePerInstanceAndNeverStopLogging(): void
+    {
+        $renderedA = [];
+        $renderedB = [];
+        $makeHandler = function (array &$rendered): ErrorHandlerLib {
+            return new ErrorHandlerLib(
+                $this->createIntegration(
+                    shouldEchoOutput: static fn (): bool => true,
+                    isTestingEnvironment: static fn (): bool => true,
+                    renderNonCriticalError: static function (string $label) use (&$rendered): void {
+                        $rendered[] = $label;
+                    }
+                ),
+                new ErrorHandlerNoOpSkipDecider()
+            );
+        };
+        $handlerA = $makeHandler($renderedA);
+        $handlerB = $makeHandler($renderedB);
+
+        $log = $this->captureErrorLog(static function () use ($handlerA, $handlerB): void {
+            for ($i = 1; $i <= 4; $i++) {
+                $handlerA->handleError(E_USER_WARNING, "capped warning {$i}", '/app/src/Cap.php', $i);
+                $handlerA->handleError(E_USER_NOTICE, "capped notice {$i}", '/app/src/Cap.php', $i);
+            }
+
+            $handlerB->handleError(E_USER_WARNING, 'fresh warning', '/app/src/Cap.php', 9);
+        }, E_ALL);
+
+        self::assertSame(['Warning', 'Notice', 'Warning', 'Notice'], $renderedA);
+        self::assertSame(['Warning'], $renderedB, 'Another instance starts with its own counters.');
+
+        for ($i = 1; $i <= 4; $i++) {
+            self::assertStringContainsString("capped warning {$i}", $log);
+            self::assertStringContainsString("capped notice {$i}", $log);
+        }
+    }
+
+    /**
+     * @param Closure(int, string, string, int): bool $decide
+     */
+    private static function skipDecider(Closure $decide): ErrorHandlerSkipDeciderInterface
+    {
+        return new class($decide) implements ErrorHandlerSkipDeciderInterface {
+            public function __construct(private readonly Closure $decide)
+            {
+            }
+
+            public function shouldSkip(int $errno, string $errstr, string $errfile, int $errline): bool
+            {
+                return (bool) ($this->decide)($errno, $errstr, $errfile, $errline);
+            }
+        };
+    }
+
     /**
      * Runs $callback and then restores the error handler stack, the exception handler stack and the
      * ini directives register() may touch, whether or not an assertion inside $callback failed.
