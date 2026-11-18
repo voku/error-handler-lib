@@ -22,8 +22,9 @@ namespace voku\ErrorHandlerLib;
  * handled exactly like a reported one of the same type - in particular, notices and deprecations are
  * only logged or rendered when {@see ErrorHandlerIntegrationInterface::isTestingEnvironment()} is true.
  *
- * Whatever the policy, the handler returns `false` for a suppressed diagnostic, so PHP still records
- * it for `error_get_last()` without displaying or logging it.
+ * Whatever the policy, the handler returns `false` for a suppressed non-critical diagnostic, so PHP
+ * still records it for `error_get_last()` without displaying or logging it. A critical diagnostic
+ * goes to the non-returning critical renderer instead, suppressed or not.
  */
 enum SuppressedDiagnosticPolicy
 {

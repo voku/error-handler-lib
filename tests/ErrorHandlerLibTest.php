@@ -8,6 +8,7 @@ use Closure;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 use stdClass;
+use Throwable;
 use voku\ErrorHandlerLib\ErrorHandlerIntegrationInterface;
 use voku\ErrorHandlerLib\ErrorHandlerLib;
 use voku\ErrorHandlerLib\ErrorHandlerNoOpSkipDecider;
@@ -956,75 +957,195 @@ final class ErrorHandlerLibTest extends TestCase
 
     public function testRegisterIsIdempotentAndUnregisterRestoresThePreviousHandlerWithItsMask(): void
     {
-        $previousHandler = static fn (): bool => true;
-        set_error_handler($previousHandler, E_USER_NOTICE);
-        $previousDisplayErrors = (string) ini_get('display_errors');
-        $previousIgnoreArgs = (string) ini_get('zend.exception_ignore_args');
+        $this->withRestoredHandlerState(function (): void {
+            $previousHandler = static fn (): bool => true;
+            set_error_handler($previousHandler, E_USER_NOTICE);
+            ini_set('display_errors', '1');
 
-        try {
             $handler = new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider());
             $handler->register();
             $handler->register();
             self::assertTrue($handler->isRegistered());
-            self::assertSame($previousIgnoreArgs, (string) ini_get('zend.exception_ignore_args'), 'Trace arguments are opt-in.');
+            self::assertFalse(filter_var(ini_get('display_errors'), FILTER_VALIDATE_BOOLEAN));
 
             $handler->unregister();
             self::assertFalse($handler->isRegistered());
-            self::assertSame($previousDisplayErrors, (string) ini_get('display_errors'));
-
-            $top = set_error_handler(static fn (): bool => false);
-            restore_error_handler();
-            self::assertSame($previousHandler, $top, 'A second register() must not stack a second handler.');
-
-            // The restored handler kept its E_USER_NOTICE mask: a warning reaches PHP, not the handler.
-            $lastError = $this->withErrorReporting(E_ALL, function (): ?array {
-                error_clear_last();
-                $this->captureErrorLog(static function (): void {
-                    @trigger_error('outside the mask', E_USER_WARNING);
-                }, E_ALL);
-
-                return error_get_last();
-            });
-            self::assertSame('outside the mask', $lastError['message'] ?? null);
-        } finally {
-            restore_error_handler();
-        }
+            self::assertSame('1', (string) ini_get('display_errors'));
+            self::assertSame($previousHandler, self::currentErrorHandler(), 'A second register() must not stack a second handler.');
+            self::assertPreviousHandlerKeptItsUserNoticeMask();
+        });
     }
 
-    public function testUnregisterRefusesToPopAHandlerRegisteredAfterIt(): void
+    public function testRegisterLeavesTraceArgumentsAloneWithoutOptIn(): void
     {
-        $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
-        $later = static fn (): bool => true;
-        set_error_handler($later);
+        $this->withRestoredHandlerState(function (): void {
+            ini_set('zend.exception_ignore_args', '1');
 
-        try {
+            $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+            self::assertSame('1', (string) ini_get('zend.exception_ignore_args'));
             $handler->unregister();
-            self::fail('Expected unregister() to refuse.');
-        } catch (\LogicException) {
-            self::assertTrue($handler->isRegistered());
-        } finally {
+        });
+    }
+
+    public function testUnregisterRefusesToPopAnErrorHandlerRegisteredAfterIt(): void
+    {
+        $this->withRestoredHandlerState(function (): void {
+            $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+            $later = static fn (): bool => true;
+            set_error_handler($later);
+
+            try {
+                $handler->unregister();
+                self::fail('Expected unregister() to refuse.');
+            } catch (\LogicException) {
+                self::assertTrue($handler->isRegistered());
+                self::assertSame($later, self::currentErrorHandler());
+            }
+
             restore_error_handler();
             $handler->unregister();
-        }
+            self::assertFalse($handler->isRegistered());
+        });
+    }
+
+    public function testUnregisterRestoresThePreviousExceptionHandler(): void
+    {
+        $this->withRestoredHandlerState(function (): void {
+            $previousExceptionHandler = static function (\Throwable $throwable): void {
+            };
+            set_exception_handler($previousExceptionHandler);
+
+            $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+            self::assertNotSame($previousExceptionHandler, self::currentExceptionHandler());
+
+            $handler->unregister();
+            self::assertSame($previousExceptionHandler, self::currentExceptionHandler());
+        });
+    }
+
+    public function testUnregisterRefusesToPopAnExceptionHandlerRegisteredAfterIt(): void
+    {
+        $this->withRestoredHandlerState(function (): void {
+            $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+            $libraryErrorHandler = self::currentErrorHandler();
+            $later = static function (\Throwable $throwable): void {
+            };
+            set_exception_handler($later);
+
+            try {
+                $handler->unregister();
+                self::fail('Expected unregister() to refuse.');
+            } catch (\LogicException) {
+                self::assertTrue($handler->isRegistered());
+                self::assertSame($later, self::currentExceptionHandler());
+                self::assertSame($libraryErrorHandler, self::currentErrorHandler(), 'Nothing may be popped on refusal.');
+            }
+
+            restore_exception_handler();
+            $handler->unregister();
+        });
     }
 
     public function testOptingIntoTraceArgumentsEnablesExceptionArgumentsUntilUnregistered(): void
     {
-        $previous = (string) ini_get('zend.exception_ignore_args');
-        ini_set('zend.exception_ignore_args', 'On');
+        $this->withRestoredHandlerState(function (): void {
+            ini_set('zend.exception_ignore_args', 'On');
 
-        $handler = new ErrorHandlerLib($this->createIntegration(includeTraceArguments: true), new ErrorHandlerNoOpSkipDecider());
-
-        try {
-            $handler->register();
+            $handler = (new ErrorHandlerLib($this->createIntegration(includeTraceArguments: true), new ErrorHandlerNoOpSkipDecider()))->register();
             self::assertFalse(filter_var(ini_get('zend.exception_ignore_args'), FILTER_VALIDATE_BOOLEAN));
 
             $handler->unregister();
-            self::assertTrue(filter_var(ini_get('zend.exception_ignore_args'), FILTER_VALIDATE_BOOLEAN));
-        } finally {
+            self::assertSame('On', (string) ini_get('zend.exception_ignore_args'));
+        });
+    }
+
+    /**
+     * register() found both directives already at its target values, so it changed nothing and
+     * must not write its snapshot back over what the host decided after registration.
+     */
+    public function testUnregisterKeepsIniChangesTheLibraryDidNotMake(): void
+    {
+        $this->withRestoredHandlerState(function (): void {
+            ini_set('zend.exception_ignore_args', '0');
+            ini_set('display_errors', '0');
+            ini_set('display_startup_errors', '0');
+
+            $handler = (new ErrorHandlerLib($this->createIntegration(includeTraceArguments: true), new ErrorHandlerNoOpSkipDecider()))->register();
+            self::assertSame('0', (string) ini_get('zend.exception_ignore_args'), 'Equivalent values are not rewritten.');
+            self::assertSame('0', (string) ini_get('display_errors'));
+
+            ini_set('zend.exception_ignore_args', 'On');
+            ini_set('display_errors', 'stderr');
+
             $handler->unregister();
-            ini_set('zend.exception_ignore_args', $previous);
-        }
+            self::assertSame('On', (string) ini_get('zend.exception_ignore_args'));
+            self::assertSame('stderr', (string) ini_get('display_errors'));
+        });
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function provideRegistrationHooks(): iterable
+    {
+        yield 'includeTraceArguments() throws' => ['includeTraceArguments'];
+        yield 'shouldDisplayErrors() throws' => ['shouldDisplayErrors'];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('provideRegistrationHooks')]
+    public function testRegisterChangesNothingWhenAnIntegrationHookThrowsAndCanBeRetried(string $throwingHook): void
+    {
+        $this->withRestoredHandlerState(function () use ($throwingHook): void {
+            $previousHandler = static fn (): bool => true;
+            set_error_handler($previousHandler, E_USER_NOTICE);
+            $previousExceptionHandler = static function (\Throwable $throwable): void {
+            };
+            set_exception_handler($previousExceptionHandler);
+            ini_set('display_errors', 'stderr');
+            ini_set('display_startup_errors', '1');
+            ini_set('zend.exception_ignore_args', '1');
+
+            $fail = true;
+            $hook = static function () use (&$fail, $throwingHook): bool {
+                if ($fail) {
+                    throw new RuntimeException($throwingHook . ' failed');
+                }
+
+                return true;
+            };
+            $handler = new ErrorHandlerLib(
+                $throwingHook === 'includeTraceArguments'
+                    ? $this->createIntegration(includeTraceArgumentsHook: $hook)
+                    : $this->createIntegration(shouldDisplayErrors: $hook),
+                new ErrorHandlerNoOpSkipDecider()
+            );
+
+            try {
+                $handler->register();
+                self::fail('Expected the integration hook to throw.');
+            } catch (RuntimeException $exception) {
+                self::assertSame($throwingHook . ' failed', $exception->getMessage());
+            }
+
+            self::assertFalse($handler->isRegistered());
+            self::assertSame($previousHandler, self::currentErrorHandler());
+            self::assertSame($previousExceptionHandler, self::currentExceptionHandler());
+            self::assertSame('stderr', (string) ini_get('display_errors'));
+            self::assertSame('1', (string) ini_get('display_startup_errors'));
+            self::assertSame('1', (string) ini_get('zend.exception_ignore_args'));
+            self::assertPreviousHandlerKeptItsUserNoticeMask();
+
+            $fail = false;
+            $handler->register();
+            self::assertTrue($handler->isRegistered());
+            self::assertNotSame($previousHandler, self::currentErrorHandler());
+
+            $handler->unregister();
+            self::assertSame($previousHandler, self::currentErrorHandler());
+            self::assertSame($previousExceptionHandler, self::currentExceptionHandler());
+            self::assertSame('stderr', (string) ini_get('display_errors'));
+            self::assertSame('1', (string) ini_get('zend.exception_ignore_args'));
+        });
     }
 
     public function testShutdownFatalErrorGoesToTheActiveNestedRegistration(): void
@@ -1046,13 +1167,116 @@ final class ErrorHandlerLibTest extends TestCase
 
     public function testUnregisteredHandlerIsNotRetainedByTheLibrary(): void
     {
-        $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
-        $handler->unregister();
-        $reference = \WeakReference::create($handler);
-        unset($handler);
-        gc_collect_cycles();
+        $this->withRestoredHandlerState(function (): void {
+            $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+            $handler->unregister();
+            $reference = \WeakReference::create($handler);
+            unset($handler);
+            gc_collect_cycles();
 
-        self::assertNull($reference->get(), 'A worker that creates one handler per job must not accumulate them.');
+            self::assertNull($reference->get(), 'A worker that creates one handler per job must not accumulate them.');
+        });
+    }
+
+    public function testShutdownFatalErrorSurvivesAnEarlierHostShutdownCallbackThatRaisesASuppressedWarning(): void
+    {
+        $output = $this->runFixture('nested-registration-fatal.php', ['host-shutdown-overwrites-last-error']);
+
+        self::assertStringContainsString('HANDLED-BY:inner', $output);
+        self::assertStringContainsString('FixtureClassDeclaredTwice', $output);
+    }
+
+    /**
+     * PHP 8.5 attaches the fatal error's backtrace to error_get_last(). Without it, the only trace
+     * available at shutdown is the library's own, which never reaches the fixture's function.
+     */
+    #[\PHPUnit\Framework\Attributes\RequiresPhp('>= 8.5')]
+    public function testShutdownFatalErrorUsesThePhp85FatalErrorBacktrace(): void
+    {
+        $output = $this->runFixture('nested-registration-fatal.php', ['fatal-inside-function']);
+
+        self::assertStringContainsString('HANDLED-BY:inner', $output);
+        self::assertMatchesRegularExpression('/^#\d+ .*includeRedeclaringFile\(\)$/m', $output);
+    }
+
+    /**
+     * @return iterable<string, array{Closure(Throwable): void, int}>
+     */
+    public static function provideReportHelpers(): iterable
+    {
+        yield 'reportError()' => [static fn (Throwable $throwable) => ErrorHandlerLib::reportError($throwable), E_USER_WARNING];
+        yield 'reportWarning()' => [static fn (Throwable $throwable) => ErrorHandlerLib::reportWarning($throwable), E_USER_DEPRECATED];
+    }
+
+    /**
+     * @param Closure(Throwable): void $report
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('provideReportHelpers')]
+    public function testReportHelpersDoNotLeakThrowableTraceArguments(Closure $report, int $expectedType): void
+    {
+        $previousIgnoreArgs = (string) ini_get('zend.exception_ignore_args');
+        $previousMaxLength = (string) ini_get('zend.exception_string_param_max_len');
+        ini_set('zend.exception_ignore_args', '0');
+        ini_set('zend.exception_string_param_max_len', '100');
+
+        try {
+            $throwable = self::createExceptionWithArgument('SECRET_42');
+            $phpRendering = $throwable->__toString();
+        } finally {
+            ini_set('zend.exception_ignore_args', $previousIgnoreArgs);
+            ini_set('zend.exception_string_param_max_len', $previousMaxLength);
+        }
+
+        self::assertStringContainsString('SECRET_42', $phpRendering, 'Precondition: PHP itself would leak the argument.');
+
+        // The emitted diagnostic itself.
+        $emitted = null;
+        set_error_handler(static function (int $errno, string $errstr) use (&$emitted): bool {
+            $emitted = [$errno, $errstr];
+
+            return true;
+        });
+
+        try {
+            $report($throwable);
+        } finally {
+            restore_error_handler();
+        }
+
+        self::assertSame($expectedType, $emitted[0] ?? null);
+        self::assertSame(
+            'RuntimeException: ' . $throwable->getMessage() . ' in ' . $throwable->getFile() . ':' . $throwable->getLine(),
+            $emitted[1] ?? null
+        );
+
+        // The same diagnostic through the library: log and rendered report.
+        $rendered = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                shouldEchoOutput: static fn (): bool => true,
+                isTestingEnvironment: static fn (): bool => true,
+                renderNonCriticalError: static function (string $label, string $details) use (&$rendered): void {
+                    $rendered[] = $details;
+                }
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $log = $this->captureErrorLog(static function () use ($handler, $report, $throwable): void {
+            set_error_handler($handler->handleError(...), E_ALL);
+
+            try {
+                $report($throwable);
+            } finally {
+                restore_error_handler();
+            }
+        }, E_ALL);
+
+        self::assertCount(1, $rendered);
+        self::assertStringContainsString('Login failed', $rendered[0]);
+        self::assertStringNotContainsString('SECRET_42', $rendered[0]);
+        self::assertStringContainsString('Login failed', $log);
+        self::assertStringNotContainsString('SECRET_42', $log);
     }
 
     public function testPreviousExceptionChainOmitsArgumentValuesByDefault(): void
@@ -1125,6 +1349,92 @@ final class ErrorHandlerLibTest extends TestCase
     private static function createExceptionWithArgument(string $password): RuntimeException
     {
         return new RuntimeException('Login failed for a ' . strlen($password) . '-character password');
+    }
+
+    /**
+     * Runs $callback and then restores the error handler stack, the exception handler stack and the
+     * ini directives register() may touch, whether or not an assertion inside $callback failed.
+     *
+     * Sentinel handlers mark the original top of each stack, so cleanup pops exactly what the test
+     * left behind - including a still-registered library handler.
+     */
+    private function withRestoredHandlerState(Closure $callback): void
+    {
+        $directives = ['display_errors', 'display_startup_errors', 'zend.exception_ignore_args'];
+        $iniValues = [];
+        foreach ($directives as $directive) {
+            $iniValues[$directive] = (string) ini_get($directive);
+        }
+
+        $errorSentinel = static fn (): bool => false;
+        $exceptionSentinel = static function (\Throwable $throwable): void {
+        };
+        set_error_handler($errorSentinel);
+        set_exception_handler($exceptionSentinel);
+
+        try {
+            $callback();
+        } finally {
+            for ($i = 0; $i < 20 && self::currentErrorHandler() !== $errorSentinel; $i++) {
+                restore_error_handler();
+            }
+            restore_error_handler();
+
+            for ($i = 0; $i < 20 && self::currentExceptionHandler() !== $exceptionSentinel; $i++) {
+                restore_exception_handler();
+            }
+            restore_exception_handler();
+
+            foreach ($iniValues as $directive => $value) {
+                ini_set($directive, $value);
+            }
+        }
+    }
+
+    /**
+     * Reads the active error handler without changing the stack (the probe is popped again, and the
+     * entry below it keeps its original type mask).
+     */
+    private static function currentErrorHandler(): mixed
+    {
+        $current = set_error_handler(static fn (): bool => false);
+        restore_error_handler();
+
+        return $current;
+    }
+
+    private static function currentExceptionHandler(): mixed
+    {
+        $current = set_exception_handler(static function (\Throwable $throwable): void {
+        });
+        restore_exception_handler();
+
+        return $current;
+    }
+
+    /**
+     * The active handler was installed for E_USER_NOTICE only: a user warning must bypass it and
+     * reach PHP, which records it. A handler re-installed for E_ALL would swallow it instead.
+     */
+    private static function assertPreviousHandlerKeptItsUserNoticeMask(): void
+    {
+        $previousLevel = error_reporting(E_ALL);
+        $previousLogErrors = (string) ini_get('log_errors');
+        $previousDisplayErrors = (string) ini_get('display_errors');
+        ini_set('log_errors', '0');
+        ini_set('display_errors', '0');
+
+        try {
+            error_clear_last();
+            @trigger_error('outside the mask', E_USER_WARNING);
+            $lastError = error_get_last();
+        } finally {
+            error_reporting($previousLevel);
+            ini_set('log_errors', $previousLogErrors);
+            ini_set('display_errors', $previousDisplayErrors);
+        }
+
+        self::assertSame('outside the mask', $lastError['message'] ?? null, 'The previous handler lost its type mask.');
     }
 
     /**
@@ -1224,9 +1534,11 @@ final class ErrorHandlerLibTest extends TestCase
         ?Closure $addDebugBarMessage = null,
         ?Closure $renderNonCriticalError = null,
         SuppressedDiagnosticPolicy $suppressedDiagnosticPolicy = SuppressedDiagnosticPolicy::Observe,
-        bool $includeTraceArguments = false
+        bool $includeTraceArguments = false,
+        ?Closure $includeTraceArgumentsHook = null,
+        ?Closure $shouldDisplayErrors = null
     ): ErrorHandlerIntegrationInterface {
-        return new class($describeObject, $renderJavaScriptErrorHandler, $getGlobalInfo, $sanitizeErrorDetails, $renderCriticalError, $shouldEchoOutput, $isTestingEnvironment, $isDebugBarRequest, $addDebugBarMessage, $renderNonCriticalError, $suppressedDiagnosticPolicy, $includeTraceArguments) implements ErrorHandlerIntegrationInterface {
+        return new class($describeObject, $renderJavaScriptErrorHandler, $getGlobalInfo, $sanitizeErrorDetails, $renderCriticalError, $shouldEchoOutput, $isTestingEnvironment, $isDebugBarRequest, $addDebugBarMessage, $renderNonCriticalError, $suppressedDiagnosticPolicy, $includeTraceArguments, $includeTraceArgumentsHook, $shouldDisplayErrors) implements ErrorHandlerIntegrationInterface {
             public function __construct(
                 private readonly ?Closure $describeObject,
                 private readonly ?Closure $renderJavaScriptErrorHandler,
@@ -1239,13 +1551,15 @@ final class ErrorHandlerLibTest extends TestCase
                 private readonly ?Closure $addDebugBarMessage,
                 private readonly ?Closure $renderNonCriticalError,
                 private readonly SuppressedDiagnosticPolicy $suppressedDiagnosticPolicy,
-                private readonly bool $includeTraceArguments
+                private readonly bool $includeTraceArguments,
+                private readonly ?Closure $includeTraceArgumentsHook,
+                private readonly ?Closure $shouldDisplayErrors
             ) {
             }
 
             public function includeTraceArguments(): bool
             {
-                return $this->includeTraceArguments;
+                return $this->includeTraceArgumentsHook ? (bool) ($this->includeTraceArgumentsHook)() : $this->includeTraceArguments;
             }
 
             public function suppressedDiagnosticPolicy(): SuppressedDiagnosticPolicy
@@ -1260,7 +1574,7 @@ final class ErrorHandlerLibTest extends TestCase
 
             public function shouldDisplayErrors(): bool
             {
-                return false;
+                return $this->shouldDisplayErrors ? (bool) ($this->shouldDisplayErrors)() : false;
             }
 
             public function isTestingEnvironment(): bool

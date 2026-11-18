@@ -8,6 +8,7 @@ declare(strict_types=1);
  * PHP runs shutdown functions in registration order, so a per-instance shutdown callback would let
  * the outer (first) registration report a fatal error that belongs to the inner, active one.
  * With "unregister-inner" the inner registration is gone again and the outer one must report it.
+ * "host-shutdown-overwrites-last-error" and "fatal-inside-function" are explained where they apply.
  */
 
 require dirname(__DIR__, 2) . '/vendor/autoload.php';
@@ -94,10 +95,24 @@ final class LabelledIntegration implements ErrorHandlerIntegrationInterface
 
 ini_set('log_errors', '0');
 
+$mode = (string) ($argv[1] ?? '');
+
+if ($mode === 'host-shutdown-overwrites-last-error') {
+    // Registered before the library's dispatcher, so it runs first. The suppressed warning is
+    // returned to PHP (`false`), which records it and would replace the fatal in error_get_last().
+    register_shutdown_function(static function (): void {
+        @file_get_contents(__DIR__ . '/does-not-exist.txt');
+    });
+}
+
+if ($mode === 'fatal-inside-function' && PHP_VERSION_ID >= 80500) {
+    ini_set('fatal_error_backtraces', '1');
+}
+
 (new ErrorHandlerLib(new LabelledIntegration('outer')))->register();
 $inner = (new ErrorHandlerLib(new LabelledIntegration('inner')))->register();
 
-if (($argv[1] ?? '') === 'unregister-inner') {
+if ($mode === 'unregister-inner') {
     $inner->unregister();
 }
 
@@ -105,4 +120,9 @@ final class FixtureClassDeclaredTwice
 {
 }
 
-include __DIR__ . '/redeclare-fixture-class.php';
+function includeRedeclaringFile(): void
+{
+    include __DIR__ . '/redeclare-fixture-class.php';
+}
+
+includeRedeclaringFile();

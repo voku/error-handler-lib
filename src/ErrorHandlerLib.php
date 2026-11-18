@@ -52,6 +52,18 @@ final class ErrorHandlerLib
 
     private static bool $shutdownDispatcherRegistered = false;
 
+    /**
+     * Error types that end the script, so `error_get_last()` can only hold one during shutdown.
+     */
+    private const int SCRIPT_TERMINATING_ERROR_TYPES = E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR;
+
+    /**
+     * The fatal error as `error_get_last()` reported it before a later diagnostic replaced it.
+     *
+     * @var null|array<string, mixed>
+     */
+    private static ?array $pendingFatalError = null;
+
     private readonly int $fatalErrorTypes;
 
     private readonly ErrorHandlerIntegrationInterface $integration;
@@ -73,9 +85,10 @@ final class ErrorHandlerLib
     private ?Closure $registeredExceptionHandler = null;
 
     /**
-     * ini values that {@see register()} changed, keyed by directive, so {@see unregister()} can put them back.
+     * ini values that {@see register()} actually changed, keyed by directive, holding the value
+     * before the change, so {@see unregister()} can put back exactly those and nothing else.
      *
-     * @var array<string, string|false>
+     * @var array<string, string>
      */
     private array $previousIniValues = [];
 
@@ -179,10 +192,11 @@ final class ErrorHandlerLib
      * Steps 2 and 3 apply to non-critical diagnostics only, so neither a suppression policy
      * nor a skip decider can hide a fatal error or an uncaught exception.
      *
-     * A PHP-suppressed diagnostic always returns `false`, whatever the policy or the skip decider
-     * decided. PHP's native handler then respects the suppression (nothing is displayed or logged),
-     * but still records the diagnostic, so `error_get_last()` keeps working for code such as
-     * `if (@fopen($path, 'rb') === false) { $error = error_get_last(); }`.
+     * A PHP-suppressed non-critical diagnostic always returns `false`, whatever the policy or the
+     * skip decider decided. PHP's native handler then respects the suppression (nothing is displayed
+     * or logged), but still records the diagnostic, so `error_get_last()` keeps working for code such
+     * as `if (@fopen($path, 'rb') === false) { $error = error_get_last(); }`. A critical diagnostic
+     * never returns: step 1 hands it to the non-returning critical renderer, suppressed or not.
      *
      * @param array<string, scalar|null>     $context
      * @param null|TraceList          $backtrace
@@ -195,6 +209,8 @@ final class ErrorHandlerLib
         array $context = [],
         ?array $backtrace = null
     ): bool {
+        self::rememberPendingFatalError();
+
         if (self::isCriticalDiagnostic($errno)) {
             $this->handleCriticalDiagnostic($errno, $errstr, $errfile, $errline, $context, $backtrace);
         }
@@ -300,6 +316,13 @@ final class ErrorHandlerLib
         self::$reservedMemory = null;
 
         $error = error_get_last();
+        if (
+            self::$pendingFatalError !== null
+            && (!is_array($error) || ((int) $error['type'] & self::SCRIPT_TERMINATING_ERROR_TYPES) === 0)
+        ) {
+            $error = self::$pendingFatalError;
+        }
+
         if (!is_array($error)) {
             return;
         }
@@ -317,6 +340,27 @@ final class ErrorHandlerLib
         );
 
         $this->handleThrowable($exception, [], self::fatalErrorTrace($error) ?? $exception->getTrace());
+    }
+
+    /**
+     * Shutdown functions registered before the library's dispatcher run first. If one of them raises
+     * a diagnostic that this handler returns `false` for (a PHP-suppressed one, for example), PHP
+     * records that diagnostic and `error_get_last()` no longer returns the fatal error. Keep the
+     * fatal error before that can happen.
+     *
+     * Nothing is preserved if this handler is not active at that point, or if a shutdown function
+     * calls `error_clear_last()` or installs its own error handler.
+     */
+    private static function rememberPendingFatalError(): void
+    {
+        if (self::$pendingFatalError !== null) {
+            return;
+        }
+
+        $last = error_get_last();
+        if (is_array($last) && ((int) $last['type'] & self::SCRIPT_TERMINATING_ERROR_TYPES) !== 0) {
+            self::$pendingFatalError = $last;
+        }
     }
 
     private function describeThrowableChain(Throwable $throwable): string
@@ -437,6 +481,11 @@ final class ErrorHandlerLib
             return $this;
         }
 
+        // Ask the integration first: if a hook throws, nothing has been changed yet and a retry
+        // asks again.
+        $includeTraceArguments = $this->integration->includeTraceArguments();
+        $displayErrors = $this->integration->shouldDisplayErrors();
+
         self::registerShutdownDispatcher();
         $this->registerErrorHandler()
             ->registerExceptionHandler();
@@ -444,11 +493,11 @@ final class ErrorHandlerLib
         $this->registered = true;
         self::$registeredInstances[spl_object_id($this)] = $this;
 
-        if ($this->integration->includeTraceArguments()) {
+        if ($includeTraceArguments) {
             $this->setIni('zend.exception_ignore_args', 'Off');
         }
 
-        if ($this->integration->shouldDisplayErrors()) {
+        if ($displayErrors) {
             $this->setIni('display_startup_errors', 'On');
 
             return $this;
@@ -468,6 +517,14 @@ final class ErrorHandlerLib
      * Handler stacks are LIFO. If another error or exception handler was installed after this one,
      * nothing is changed and a {@see LogicException} is thrown: popping the stack would remove the
      * other handler instead of this one.
+     *
+     * The check compares the active handler with the closure `register()` installed. It cannot detect
+     * that same closure being installed again further up the stack (for example after a caller saved
+     * the return value of `set_error_handler()` and re-installed it); `unregister()` would then pop
+     * only the upper copy. Do not re-install the library's handler closures yourself.
+     *
+     * Only ini values that `register()` actually changed are restored. A directive `register()` left
+     * alone is never written, so a value the host set after registration survives.
      */
     public function unregister(): self
     {
@@ -495,9 +552,7 @@ final class ErrorHandlerLib
         restore_exception_handler();
 
         foreach (array_reverse($this->previousIniValues, true) as $directive => $value) {
-            if ($value !== false) {
-                ini_set($directive, $value);
-            }
+            ini_set($directive, $value);
         }
 
         unset(self::$registeredInstances[spl_object_id($this)]);
@@ -514,13 +569,42 @@ final class ErrorHandlerLib
         return $this->registered;
     }
 
+    /**
+     * Changes a directive only if its effective value differs, and records the old value only if
+     * the change took effect. A failed `ini_set()` (unknown directive, or one the runtime refuses
+     * to change) leaves nothing to restore, so it is not recorded.
+     */
     private function setIni(string $directive, string $value): void
     {
-        if (!array_key_exists($directive, $this->previousIniValues)) {
-            $this->previousIniValues[$directive] = ini_get($directive);
+        $current = ini_get($directive);
+        if ($current === false || self::iniValuesAreEquivalent($current, $value)) {
+            return;
         }
 
-        ini_set($directive, $value);
+        if (ini_set($directive, $value) === false) {
+            return;
+        }
+
+        if (!array_key_exists($directive, $this->previousIniValues)) {
+            $this->previousIniValues[$directive] = $current;
+        }
+    }
+
+    /**
+     * PHP stores boolean directives in the form they were given ("Off", "0", "", "false" ...), so
+     * compare boolean-looking values by meaning. Anything else (such as `display_errors=stderr`)
+     * must match exactly.
+     */
+    private static function iniValuesAreEquivalent(string $current, string $target): bool
+    {
+        $currentBool = filter_var($current, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+        $targetBool = filter_var($target, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+
+        if ($currentBool !== null && $targetBool !== null) {
+            return $currentBool === $targetBool;
+        }
+
+        return $current === $target;
     }
 
     /**
@@ -578,9 +662,18 @@ final class ErrorHandlerLib
         $this->integration->renderCriticalError($details, $echoOutput);
     }
 
+    /**
+     * A throwable is reduced to class, message and origin. Not `Throwable::__toString()`: that renders
+     * the stack trace with argument values whenever the runtime keeps them. The handler that receives
+     * the reported diagnostic adds its own trace under its own argument policy.
+     */
     private static function stringifyError(string|Throwable $error): string
     {
-        return $error instanceof Throwable ? $error->__toString() : $error;
+        if (!$error instanceof Throwable) {
+            return $error;
+        }
+
+        return $error::class . ': ' . $error->getMessage() . ' in ' . $error->getFile() . ':' . $error->getLine();
     }
 
     /**

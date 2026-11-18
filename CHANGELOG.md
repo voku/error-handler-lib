@@ -18,6 +18,9 @@ All notable changes to this project are documented in this file.
   (which was truncated to 256 characters). It is a separate
   `Previous throwables (outermost first):` section in the report, formatted
   by the library so it honours `includeTraceArguments()`.
+- `reportError()` and `reportWarning()` report a `Throwable` as class, message
+  and origin instead of `Throwable::__toString()`, so the raised diagnostic no
+  longer contains the throwable's own stack trace.
 
 ### Added
 
@@ -29,8 +32,15 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
-- PHP-suppressed diagnostics now return `false` from `handleError()` under every
-  policy and skip decision, so `error_get_last()` still sees them.
+- PHP-suppressed non-critical diagnostics now return `false` from `handleError()`
+  under every policy and skip decision, so `error_get_last()` still sees them.
+  Critical diagnostics still go to the non-returning critical renderer.
+- A fatal error is still reported when a shutdown function registered before
+  the library raises a diagnostic that would replace it in `error_get_last()`.
+- If an integration hook throws inside `register()`, no handler or ini value
+  has been changed yet, and `register()` can be retried.
+- `unregister()` restores only ini values that `register()` actually changed;
+  a directive that already had the target value is not overwritten later.
 - Debug-bar messages now pass through `sanitizeErrorDetails()`.
 - Calling `register()` twice no longer stacks a second error handler,
   exception handler or shutdown callback.
