@@ -48,6 +48,11 @@ final class ErrorHandlerDefaultIntegration implements ErrorHandlerIntegrationInt
         return '';
     }
 
+    public function includeTraceArguments(): bool
+    {
+        return false;
+    }
+
     public function sanitizeErrorDetails(string $details): string
     {
         return $details;

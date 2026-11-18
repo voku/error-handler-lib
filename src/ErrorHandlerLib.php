@@ -6,6 +6,7 @@ namespace voku\ErrorHandlerLib;
 
 use Closure;
 use ErrorException;
+use LogicException;
 use ReflectionException;
 use ReflectionFunction;
 use Throwable;
@@ -23,6 +24,12 @@ final class ErrorHandlerLib
     private const int MAX_STR_LENGTH_FROM_TYPE_INFO = 256;
     private const int RESERVED_MEMORY_SIZE = 512;
 
+    /**
+     * Held only so it can be released in {@see handleFatalError()}, giving an out-of-memory fatal
+     * enough headroom to be reported. It is never read by design.
+     *
+     * @phpstan-ignore property.onlyWritten
+     */
     private static ?string $reservedMemory = null;
 
     private static ?ErrorHandlerIntegrationInterface $defaultIntegration = null;
@@ -43,18 +50,29 @@ final class ErrorHandlerLib
 
     private int $currentDebugBarErrorCount = 0;
 
+    private bool $registered = false;
+
+    private bool $shutdownFunctionRegistered = false;
+
+    private ?Closure $registeredErrorHandler = null;
+
+    private ?Closure $registeredExceptionHandler = null;
+
+    /**
+     * ini values that {@see register()} changed, keyed by directive, so {@see unregister()} can put them back.
+     *
+     * @var array<string, string|false>
+     */
+    private array $previousIniValues = [];
+
+    /**
+     * Constructor arguments configure this instance only. They do not change the process-wide
+     * defaults; use {@see useIntegration()} for that.
+     */
     public function __construct(
         ?ErrorHandlerIntegrationInterface $integration = null,
         ?ErrorHandlerSkipDeciderInterface $skipDecider = null
     ) {
-        if ($integration !== null) {
-            self::$defaultIntegration = $integration;
-        }
-
-        if ($skipDecider !== null) {
-            self::$defaultSkipDecider = $skipDecider;
-        }
-
         $this->integration = $integration ?? self::getDefaultIntegration();
         $this->skipDecider = $skipDecider ?? self::getDefaultSkipDecider();
         $this->fatalErrorTypes = E_ERROR
@@ -84,6 +102,12 @@ final class ErrorHandlerLib
         trigger_error(self::stringifyError($error), E_USER_WARNING);
     }
 
+    /**
+     * Reports a soft problem one severity level below {@see reportError()}.
+     *
+     * It deliberately raises `E_USER_DEPRECATED`, not `E_USER_WARNING`: `reportError()` already uses
+     * `E_USER_WARNING` because `E_USER_ERROR` is deprecated as of PHP 8.4.
+     */
     public static function reportWarning(string|Throwable $error): void
     {
         trigger_error(self::stringifyError($error), E_USER_DEPRECATED);
@@ -93,6 +117,15 @@ final class ErrorHandlerLib
      * @param array<string, scalar|null> $context
      */
     public function handleException(Throwable $throwable, array $context = []): void
+    {
+        $this->handleThrowable($throwable, $context, $throwable->getTrace());
+    }
+
+    /**
+     * @param array<string, scalar|null> $context
+     * @param TraceList                  $backtrace
+     */
+    private function handleThrowable(Throwable $throwable, array $context, array $backtrace): void
     {
         $this->lastHandledThrowable = $throwable;
 
@@ -107,7 +140,7 @@ final class ErrorHandlerLib
             $throwable->getFile(),
             $throwable->getLine(),
             $context,
-            $throwable->getTrace()
+            $backtrace
         );
     }
 
@@ -121,6 +154,11 @@ final class ErrorHandlerLib
      *
      * Steps 2 and 3 apply to non-critical diagnostics only, so neither a suppression policy
      * nor a skip decider can hide a fatal error or an uncaught exception.
+     *
+     * A PHP-suppressed diagnostic always returns `false`, whatever the policy or the skip decider
+     * decided. PHP's native handler then respects the suppression (nothing is displayed or logged),
+     * but still records the diagnostic, so `error_get_last()` keeps working for code such as
+     * `if (@fopen($path, 'rb') === false) { $error = error_get_last(); }`.
      *
      * @param array<string, scalar|null>     $context
      * @param null|TraceList          $backtrace
@@ -138,8 +176,9 @@ final class ErrorHandlerLib
         }
 
         $renderingAllowed = true;
+        $suppressedByPhp = self::isSuppressedByPhp($errno);
 
-        if (self::isSuppressedByPhp($errno)) {
+        if ($suppressedByPhp) {
             $policy = $this->integration->suppressedDiagnosticPolicy();
 
             if ($policy === SuppressedDiagnosticPolicy::Ignore) {
@@ -150,7 +189,7 @@ final class ErrorHandlerLib
         }
 
         if ($this->skipDecider->shouldSkip($errno, $errstr, $errfile, $errline)) {
-            return true;
+            return $suppressedByPhp ? false : true;
         }
 
         if ($this->integration->isDebugBarRequest()) {
@@ -185,6 +224,10 @@ final class ErrorHandlerLib
                     $echoOutput
                 );
             }
+        }
+
+        if ($suppressedByPhp) {
+            return false;
         }
 
         if (filter_var((string) ini_get('display_errors'), FILTER_VALIDATE_BOOLEAN)) {
@@ -241,15 +284,40 @@ final class ErrorHandlerLib
             return;
         }
 
-        $this->handleException(
-            new ErrorException(
-                (string) $error['message'],
-                E_ERROR,
-                (int) $error['type'],
-                (string) $error['file'],
-                (int) $error['line']
-            )
+        $exception = new ErrorException(
+            (string) $error['message'],
+            E_ERROR,
+            (int) $error['type'],
+            (string) $error['file'],
+            (int) $error['line']
         );
+
+        $this->handleThrowable($exception, [], self::fatalErrorTrace($error) ?? $exception->getTrace());
+    }
+
+    /**
+     * PHP 8.5+ can attach the backtrace of a fatal error to `error_get_last()` (`fatal_error_backtraces`).
+     * Earlier versions have no such key; the shutdown-time trace is then the only one available.
+     *
+     * @param array<string, mixed> $error
+     *
+     * @return null|TraceList
+     */
+    private static function fatalErrorTrace(array $error): ?array
+    {
+        $trace = $error['trace'] ?? null;
+        if (!is_array($trace) || $trace === [] || !array_is_list($trace)) {
+            return null;
+        }
+
+        foreach ($trace as $frame) {
+            if (!is_array($frame)) {
+                return null;
+            }
+        }
+
+        /** @var TraceList $trace */
+        return $trace;
     }
 
     /**
@@ -257,6 +325,18 @@ final class ErrorHandlerLib
      */
     public static function getTypeInfo($value, bool $showForWeb = true, int $internalCounter = 0): string
     {
+        return self::formatValue($value, $showForWeb, $internalCounter, self::getDefaultIntegration());
+    }
+
+    /**
+     * @param TraceValue $value
+     */
+    private static function formatValue(
+        $value,
+        bool $showForWeb,
+        int $internalCounter,
+        ErrorHandlerIntegrationInterface $integration
+    ): string {
         if ($internalCounter > 50) {
             return 'TO_MANY_VALUES';
         }
@@ -270,11 +350,11 @@ final class ErrorHandlerLib
         }
 
         if (is_array($value)) {
-            return self::formatArrayValue($value, $showForWeb, $internalCounter);
+            return self::formatArrayValue($value, $showForWeb, $internalCounter, $integration);
         }
 
         if (is_object($value)) {
-            return self::formatObjectValue($value);
+            return self::formatObjectValue($value, $integration);
         }
 
         if (is_resource($value) || gettype($value) === 'resource (closed)') {
@@ -293,24 +373,98 @@ final class ErrorHandlerLib
         return self::getDefaultIntegration()->renderJavaScriptErrorHandler();
     }
 
+    /**
+     * Installs the error, exception and shutdown handlers. Calling it again on a registered
+     * instance is a no-op.
+     */
     public function register(): self
     {
+        if ($this->registered) {
+            return $this;
+        }
+
         $this->registerShutdownFunction()
             ->registerErrorHandler()
             ->registerExceptionHandler();
 
-        ini_set('zend.exception_ignore_args', 'Off');
+        $this->registered = true;
+
+        if ($this->integration->includeTraceArguments()) {
+            $this->setIni('zend.exception_ignore_args', 'Off');
+        }
 
         if ($this->integration->shouldDisplayErrors()) {
-            ini_set('display_startup_errors', 'On');
+            $this->setIni('display_startup_errors', 'On');
 
             return $this;
         }
 
-        ini_set('display_errors', 'Off');
-        ini_set('display_startup_errors', 'Off');
+        $this->setIni('display_errors', 'Off');
+        $this->setIni('display_startup_errors', 'Off');
 
         return $this;
+    }
+
+    /**
+     * Reverts {@see register()}: restores the previous error and exception handlers (including the
+     * error handler's original type mask), restores every ini value `register()` changed, and turns
+     * the shutdown callback into a no-op (PHP cannot remove a shutdown function).
+     *
+     * Handler stacks are LIFO. If another error or exception handler was installed after this one,
+     * nothing is changed and a {@see LogicException} is thrown: popping the stack would remove the
+     * other handler instead of this one.
+     */
+    public function unregister(): self
+    {
+        if (!$this->registered) {
+            return $this;
+        }
+
+        $currentErrorHandler = set_error_handler(static fn (): bool => false);
+        restore_error_handler();
+
+        $currentExceptionHandler = set_exception_handler(static function (Throwable $throwable): void {
+        });
+        restore_exception_handler();
+
+        if (
+            $currentErrorHandler !== $this->registeredErrorHandler
+            || $currentExceptionHandler !== $this->registeredExceptionHandler
+        ) {
+            throw new LogicException(
+                'Cannot unregister ' . self::class . ': another error or exception handler was registered after it. Unregister that one first.'
+            );
+        }
+
+        restore_error_handler();
+        restore_exception_handler();
+
+        foreach (array_reverse($this->previousIniValues, true) as $directive => $value) {
+            if ($value !== false) {
+                ini_set($directive, $value);
+            }
+        }
+
+        $this->previousIniValues = [];
+        $this->registeredErrorHandler = null;
+        $this->registeredExceptionHandler = null;
+        $this->registered = false;
+
+        return $this;
+    }
+
+    public function isRegistered(): bool
+    {
+        return $this->registered;
+    }
+
+    private function setIni(string $directive, string $value): void
+    {
+        if (!array_key_exists($directive, $this->previousIniValues)) {
+            $this->previousIniValues[$directive] = ini_get($directive);
+        }
+
+        ini_set($directive, $value);
     }
 
     /**
@@ -387,13 +541,13 @@ final class ErrorHandlerLib
     ): void {
         if ($this->currentDebugBarErrorCount < self::MAX_ERRORS_IN_DEBUG_BAR) {
             $description = 'ErrorNo:' . $errno . ' Error:' . $errstr . ' File:' . $errfile . ' Line:' . $errline . "\n\n";
-            $description .= $this->backtrace($backtrace, true, true, false);
+            $description .= $this->backtrace($backtrace);
 
             if ($context !== []) {
-                $description .= "\n" . self::formatContext($context);
+                $description .= "\n" . $this->formatContext($context);
             }
 
-            $this->integration->addDebugBarMessage($errno, $description);
+            $this->integration->addDebugBarMessage($errno, $this->integration->sanitizeErrorDetails($description));
         }
 
         $this->currentDebugBarErrorCount++;
@@ -420,10 +574,10 @@ final class ErrorHandlerLib
         };
         $details .= $errstr . "\n";
         $details .= $this->integration->getGlobalInfo();
-        $details .= $this->backtrace($backtrace, true, true, false);
+        $details .= $this->backtrace($backtrace);
 
         if ($context !== []) {
-            $details .= "\n" . self::formatContext($context);
+            $details .= "\n" . $this->formatContext($context);
         }
 
         return $this->integration->sanitizeErrorDetails($details);
@@ -451,44 +605,35 @@ final class ErrorHandlerLib
     }
 
     /**
+     * Argument values are rendered only when the integration opts in via
+     * {@see ErrorHandlerIntegrationInterface::includeTraceArguments()}: they are the part of a
+     * trace most likely to carry credentials or personal data.
+     *
      * @param null|TraceList $backtrace
      */
-    private function backtrace(
-        ?array $backtrace = null,
-        bool $showArgs = true,
-        bool $return = true,
-        bool $showArgsFull = false
-    ): string {
+    private function backtrace(?array $backtrace = null): string
+    {
+        $showArgs = $this->integration->includeTraceArguments();
         $output = "\n\nStack trace:\n";
-        $trace = $backtrace ?? debug_backtrace();
+        $trace = $backtrace ?? debug_backtrace($showArgs ? 0 : DEBUG_BACKTRACE_IGNORE_ARGS);
         $frameNumber = 0;
-
-        if ($showArgs && $showArgsFull) {
-            $output = "\n\nStack trace with full parameters:\n";
-        }
 
         foreach ($trace as $frame) {
             if (($frame['class'] ?? null) === self::class) {
                 continue;
             }
 
-            $line = self::formatTraceFrame($frame, $frameNumber, $showArgs, $showArgsFull) . "\n";
+            $output .= $this->formatTraceFrame($frame, $frameNumber, $showArgs) . "\n";
             $frameNumber++;
-
-            if ($return) {
-                $output .= $line;
-            } else {
-                echo $line;
-            }
         }
 
-        return $return ? $output : '';
+        return $output;
     }
 
     /**
      * @param TraceFrame $frame
      */
-    private static function formatTraceFrame(array $frame, int $frameNumber, bool $showArgs, bool $showArgsFull): string
+    private function formatTraceFrame(array $frame, int $frameNumber, bool $showArgs): string
     {
         $file = self::stringFrameValue($frame['file'] ?? '');
         if ($file === '') {
@@ -507,7 +652,7 @@ final class ErrorHandlerLib
 
         $args = '';
         if ($showArgs && isset($frame['args']) && is_array($frame['args'])) {
-            $args = $showArgsFull ? trim(print_r($frame['args'], true)) : self::formatArguments($frame['args']);
+            $args = $this->formatArguments($frame['args']);
         }
 
         return sprintf('#%d %s %s(%s)', $frameNumber, $location, $caller, $args);
@@ -516,12 +661,12 @@ final class ErrorHandlerLib
     /**
      * @param array<int, TraceValue> $arguments
      */
-    private static function formatArguments(array $arguments): string
+    private function formatArguments(array $arguments): string
     {
         $formatted = [];
 
         foreach ($arguments as $argument) {
-            $formatted[] = self::getTypeInfo($argument, false);
+            $formatted[] = self::formatValue($argument, false, 0, $this->integration);
         }
 
         return implode(', ', $formatted);
@@ -530,12 +675,12 @@ final class ErrorHandlerLib
     /**
      * @param array<string, scalar|null> $context
      */
-    private static function formatContext(array $context): string
+    private function formatContext(array $context): string
     {
         $formatted = "Array\n(\n";
 
         foreach ($context as $name => $value) {
-            $formatted .= ' [' . $name . '] => ' . self::getTypeInfo($value, false, 0) . "\n";
+            $formatted .= ' [' . $name . '] => ' . self::formatValue($value, false, 0, $this->integration) . "\n";
         }
 
         return $formatted . ")\n";
@@ -558,8 +703,12 @@ final class ErrorHandlerLib
     /**
      * @param array<array-key, TraceValue> $value
      */
-    private static function formatArrayValue(array $value, bool $showForWeb, int $internalCounter): string
-    {
+    private static function formatArrayValue(
+        array $value,
+        bool $showForWeb,
+        int $internalCounter,
+        ErrorHandlerIntegrationInterface $integration
+    ): string {
         $count = count($value);
         $text = 'Array(' . $count . ')';
 
@@ -580,7 +729,7 @@ final class ErrorHandlerLib
             }
 
             $formattedKey = is_string($key) ? "'" . $key . "'" : (string) $key;
-            $parts[] = $formattedKey . ' => ' . self::getTypeInfo($innerValue, $showForWeb, $internalCounter + 1);
+            $parts[] = $formattedKey . ' => ' . self::formatValue($innerValue, $showForWeb, $internalCounter + 1, $integration);
             $position++;
         }
 
@@ -605,7 +754,7 @@ final class ErrorHandlerLib
         return true;
     }
 
-    private static function formatObjectValue(object $value): string
+    private static function formatObjectValue(object $value, ErrorHandlerIntegrationInterface $integration): string
     {
         if ($value instanceof Closure) {
             try {
@@ -621,29 +770,38 @@ final class ErrorHandlerLib
             }
         }
 
-        return self::getDefaultIntegration()->describeObject($value) ?? ('Object(' . $value::class . ')');
+        return $integration->describeObject($value) ?? ('Object(' . $value::class . ')');
     }
 
     private function registerExceptionHandler(): self
     {
-        set_exception_handler($this->handleException(...));
+        $this->registeredExceptionHandler = $this->handleException(...);
+        set_exception_handler($this->registeredExceptionHandler);
 
         return $this;
     }
 
     private function registerErrorHandler(): self
     {
-        set_error_handler($this->handleError(...), E_ALL);
+        $this->registeredErrorHandler = $this->handleError(...);
+        set_error_handler($this->registeredErrorHandler, E_ALL);
 
         return $this;
     }
 
+    /**
+     * PHP offers no way to remove a shutdown function, so it is registered once per instance and
+     * only acts while the instance is registered.
+     */
     private function registerShutdownFunction(): self
     {
-        register_shutdown_function([$this, 'handleFatalError']);
-
-        if (self::$reservedMemory !== null) {
-            self::$reservedMemory = null;
+        if (!$this->shutdownFunctionRegistered) {
+            register_shutdown_function(function (): void {
+                if ($this->registered) {
+                    $this->handleFatalError();
+                }
+            });
+            $this->shutdownFunctionRegistered = true;
         }
 
         self::$reservedMemory = str_repeat('x', self::RESERVED_MEMORY_SIZE);

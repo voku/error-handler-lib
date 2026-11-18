@@ -44,6 +44,33 @@ ErrorHandlerLib::useIntegration(new ApplicationErrorIntegration());
 (new ErrorHandlerLib())->register();
 ```
 
+`useIntegration()` sets the process-wide default. Passing an integration to the constructor configures
+that one instance only and leaves the defaults alone.
+
+### Registering and unregistering
+
+`register()` is idempotent per instance. `unregister()` reverts it: the previous error handler comes
+back with its original type mask, the previous exception handler comes back, every ini value
+`register()` changed is restored, and the shutdown callback becomes a no-op. Handler stacks are LIFO,
+so if something registered a handler after this one, `unregister()` throws a `LogicException` and
+changes nothing.
+
+```php
+$handler = (new ErrorHandlerLib())->register();
+// ... run a worker job, a test, an embedded tool ...
+$handler->unregister();
+```
+
+### Stack trace arguments are opt-in
+
+Argument values are the part of a stack trace most likely to carry passwords, tokens and personal
+data, so traces render `App\Auth->login()` rather than `App\Auth->login("admin", "hunter2")` by
+default. An integration opts in with `includeTraceArguments(): bool`. Opting in also makes
+`register()` set `zend.exception_ignore_args=Off`. Without it, the library leaves that setting alone.
+
+`sanitizeErrorDetails()` runs on every channel the library writes to: `error_log()`, rendered
+reports, the coding-agent prompt and debug-bar messages.
+
 ## The error report hands you a prompt
 
 Every rendered error report ends with a copy&paste-ready prompt for a coding agent, built from the
@@ -130,8 +157,16 @@ public function suppressedDiagnosticPolicy(): SuppressedDiagnosticPolicy
 | Case | Behavior | Typical host |
 | ---- | -------- | ------------ |
 | `Observe` (default) | suppressed diagnostics are handled like reported ones | development, tests, CI |
-| `LogOnly` | logged and recorded, never rendered into the output | production, or a narrow policy for an external tool run |
+| `LogOnly` | handled like a reported diagnostic of the same type, but never rendered into the output | production, or a narrow policy for an external tool run |
 | `Ignore` | not processed at all; PHP's normal suppression semantics apply | production that wants PHP defaults back |
+
+The policy decides *whether* a suppressed diagnostic is processed, not *how*: notices and
+deprecations are only logged or rendered when `isTestingEnvironment()` is true, whatever the policy.
+
+Whatever the policy, the handler returns `false` for a PHP-suppressed diagnostic. PHP's native
+handler then still respects the `@` (nothing is displayed or logged), but records the diagnostic,
+so `error_get_last()` keeps working for code such as
+`if (@fopen($path, 'rb') === false) { $error = error_get_last(); }`.
 
 Note that PHPUnit narrows `error_reporting()` to a fatal-only mask while a test runs, so under
 PHPUnit almost every diagnostic looks PHP-suppressed. `Observe` is what keeps the handler useful
@@ -141,7 +176,8 @@ there.
 
 A skipped diagnostic produces **no observable processing side effects**: no logging, no debug-bar
 entry, no rendering, no counters, no further integration callbacks. `handleError()` returns `true`
-for it, because the host explicitly claimed the diagnostic.
+for it, because the host explicitly claimed the diagnostic. The only exception is a PHP-suppressed
+diagnostic, which returns `false` so that `error_get_last()` keeps working (see above).
 
 `Ignore` returns `false` instead: the library declines and leaves the diagnostic to PHP.
 

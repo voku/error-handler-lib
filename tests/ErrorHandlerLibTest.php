@@ -159,7 +159,7 @@ final class ErrorHandlerLibTest extends TestCase
             }
         );
 
-        self::assertTrue($handler->handleError(E_USER_WARNING, 'skip me', '/tmp/test.php', 5));
+        self::assertTrue($this->withErrorReporting(E_ALL, static fn (): bool => $handler->handleError(E_USER_WARNING, 'skip me', '/tmp/test.php', 5)));
     }
 
     public function testHandleErrorCapsDebugBarMessagesAtFifty(): void
@@ -197,7 +197,7 @@ final class ErrorHandlerLibTest extends TestCase
             new ErrorHandlerNoOpSkipDecider()
         );
 
-        self::assertTrue($handler->handleError(E_USER_NOTICE, 'testing notice', '/tmp/notice.php', 7));
+        self::assertTrue($this->withErrorReporting(E_ALL, static fn (): bool => $handler->handleError(E_USER_NOTICE, 'testing notice', '/tmp/notice.php', 7)));
 
         self::assertCount(1, $rendered);
         self::assertSame('Notice', $rendered[0][0]);
@@ -232,7 +232,8 @@ final class ErrorHandlerLibTest extends TestCase
         $integration = $this->createIntegration(
             renderCriticalError: static function (string $details, bool $echoOutput): never {
                 throw new RuntimeException($details);
-            }
+            },
+            includeTraceArguments: true
         );
         $handler = new ErrorHandlerLib($integration, new ErrorHandlerNoOpSkipDecider());
 
@@ -281,7 +282,8 @@ final class ErrorHandlerLibTest extends TestCase
         $integration = $this->createIntegration(
             renderCriticalError: static function (string $details, bool $echoOutput): never {
                 throw new RuntimeException($details);
-            }
+            },
+            includeTraceArguments: true
         );
         $handler = new ErrorHandlerLib($integration, new ErrorHandlerNoOpSkipDecider());
 
@@ -512,7 +514,7 @@ final class ErrorHandlerLibTest extends TestCase
         $returned = null;
         $log = $this->captureErrorLog(static function () use ($handler, &$returned): void {
             $returned = $handler->handleError(E_USER_WARNING, 'skip me', '/tmp/test.php', 5);
-        });
+        }, E_ALL);
 
         self::assertTrue($returned, 'An application-skipped diagnostic stays fully handled.');
         self::assertSame([], $rendered);
@@ -823,6 +825,226 @@ final class ErrorHandlerLibTest extends TestCase
         }
     }
 
+    public function testStackTraceOmitsArgumentValuesByDefault(): void
+    {
+        $handler = new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider());
+
+        try {
+            $handler->handleError(E_USER_ERROR, 'Login failed', '/tmp/auth.php', 9, [], [
+                [
+                    'file'     => '/tmp/Auth.php',
+                    'line'     => 21,
+                    'class'    => 'App\\Auth',
+                    'type'     => '->',
+                    'function' => 'login',
+                    'args'     => ['admin', 'hunter2-secret'],
+                ],
+            ]);
+
+            self::fail('Expected critical error rendering to throw.');
+        } catch (RuntimeException $exception) {
+            $message = $exception->getMessage();
+        }
+
+        self::assertStringContainsString('#0 /tmp/Auth.php:21 App\\Auth->login()', $message);
+        self::assertStringNotContainsString('hunter2-secret', $message);
+    }
+
+    public function testDebugBarMessagePassesThroughTheIntegrationSanitizer(): void
+    {
+        $debugBarMessages = [];
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                sanitizeErrorDetails: static fn (string $details): string => str_replace('hunter2', '[REDACTED]', $details),
+                isDebugBarRequest: static fn (): bool => true,
+                addDebugBarMessage: static function (int $errno, string $description) use (&$debugBarMessages): void {
+                    $debugBarMessages[] = $description;
+                }
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        $this->captureErrorLog(static function () use ($handler): void {
+            $handler->handleError(E_USER_WARNING, 'password hunter2 rejected', '/tmp/test.php', 5, ['token' => 'hunter2']);
+        }, E_ALL);
+
+        self::assertCount(1, $debugBarMessages);
+        self::assertStringNotContainsString('hunter2', $debugBarMessages[0]);
+        self::assertStringContainsString('[REDACTED]', $debugBarMessages[0]);
+    }
+
+    public function testConstructorInjectionDoesNotChangeProcessWideDefaults(): void
+    {
+        new ErrorHandlerLib(
+            $this->createIntegration(
+                describeObject: static fn (object $value): string => 'Injected(' . $value::class . ')',
+                renderJavaScriptErrorHandler: static fn (): string => '<script>injected</script>'
+            )
+        );
+
+        self::assertSame('Object(stdClass)', ErrorHandlerLib::getTypeInfo(new stdClass(), false));
+        self::assertSame('', ErrorHandlerLib::getGlobalJavaScriptErrorHandler());
+    }
+
+    public function testInjectedIntegrationDescribesObjectsInItsOwnTraces(): void
+    {
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                describeObject: static fn (object $value): string => 'Injected(' . $value::class . ')',
+                includeTraceArguments: true
+            ),
+            new ErrorHandlerNoOpSkipDecider()
+        );
+
+        try {
+            $handler->handleError(E_USER_ERROR, 'Boom', '/tmp/x.php', 1, [], [
+                ['file' => '/tmp/y.php', 'line' => 2, 'function' => 'run', 'args' => [new stdClass()]],
+            ]);
+
+            self::fail('Expected critical error rendering to throw.');
+        } catch (RuntimeException $exception) {
+            self::assertStringContainsString('run(Injected(stdClass))', $exception->getMessage());
+        }
+    }
+
+    /**
+     * Native PHP semantics: a handler that returns `true` for an `@`-suppressed diagnostic hides it
+     * from `error_get_last()`. Observing a diagnostic must not change what the application sees.
+     */
+    public function testObservedSuppressedDiagnosticStaysVisibleToErrorGetLast(): void
+    {
+        foreach ([SuppressedDiagnosticPolicy::Observe, SuppressedDiagnosticPolicy::LogOnly, SuppressedDiagnosticPolicy::Ignore] as $policy) {
+            $handler = new ErrorHandlerLib(
+                $this->createIntegration(suppressedDiagnosticPolicy: $policy),
+                new ErrorHandlerNoOpSkipDecider()
+            );
+
+            $lastError = $this->withErrorReporting(E_ALL, function () use ($handler): ?array {
+                error_clear_last();
+                set_error_handler($handler->handleError(...), E_ALL);
+
+                try {
+                    $this->captureErrorLog(static function (): void {
+                        @trigger_error('suppressed for ' . __FUNCTION__, E_USER_WARNING);
+                    }, E_ALL);
+                } finally {
+                    restore_error_handler();
+                }
+
+                return error_get_last();
+            });
+
+            self::assertIsArray($lastError, $policy->name . ' must keep error_get_last() working.');
+            self::assertSame(E_USER_WARNING, $lastError['type']);
+        }
+    }
+
+    public function testSkippedSuppressedDiagnosticStaysVisibleToErrorGetLast(): void
+    {
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(),
+            new class() implements ErrorHandlerSkipDeciderInterface {
+                public function shouldSkip(int $errno, string $errstr, string $errfile, int $errline): bool
+                {
+                    return true;
+                }
+            }
+        );
+
+        self::assertFalse($this->withErrorReporting(0, static fn (): bool => $handler->handleError(E_USER_WARNING, 'skip me', '/tmp/test.php', 5)));
+    }
+
+    public function testRegisterIsIdempotentAndUnregisterRestoresThePreviousHandlerWithItsMask(): void
+    {
+        $previousHandler = static fn (): bool => true;
+        set_error_handler($previousHandler, E_USER_NOTICE);
+        $previousDisplayErrors = (string) ini_get('display_errors');
+        $previousIgnoreArgs = (string) ini_get('zend.exception_ignore_args');
+
+        try {
+            $handler = new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider());
+            $handler->register();
+            $handler->register();
+            self::assertTrue($handler->isRegistered());
+            self::assertSame($previousIgnoreArgs, (string) ini_get('zend.exception_ignore_args'), 'Trace arguments are opt-in.');
+
+            $handler->unregister();
+            self::assertFalse($handler->isRegistered());
+            self::assertSame($previousDisplayErrors, (string) ini_get('display_errors'));
+
+            $top = set_error_handler(static fn (): bool => false);
+            restore_error_handler();
+            self::assertSame($previousHandler, $top, 'A second register() must not stack a second handler.');
+
+            // The restored handler kept its E_USER_NOTICE mask: a warning reaches PHP, not the handler.
+            $lastError = $this->withErrorReporting(E_ALL, function (): ?array {
+                error_clear_last();
+                $this->captureErrorLog(static function (): void {
+                    @trigger_error('outside the mask', E_USER_WARNING);
+                }, E_ALL);
+
+                return error_get_last();
+            });
+            self::assertSame('outside the mask', $lastError['message'] ?? null);
+        } finally {
+            restore_error_handler();
+        }
+    }
+
+    public function testUnregisterRefusesToPopAHandlerRegisteredAfterIt(): void
+    {
+        $handler = (new ErrorHandlerLib($this->createIntegration(), new ErrorHandlerNoOpSkipDecider()))->register();
+        $later = static fn (): bool => true;
+        set_error_handler($later);
+
+        try {
+            $handler->unregister();
+            self::fail('Expected unregister() to refuse.');
+        } catch (\LogicException) {
+            self::assertTrue($handler->isRegistered());
+        } finally {
+            restore_error_handler();
+            $handler->unregister();
+        }
+    }
+
+    public function testOptingIntoTraceArgumentsEnablesExceptionArgumentsUntilUnregistered(): void
+    {
+        $previous = (string) ini_get('zend.exception_ignore_args');
+        ini_set('zend.exception_ignore_args', 'On');
+
+        $handler = new ErrorHandlerLib($this->createIntegration(includeTraceArguments: true), new ErrorHandlerNoOpSkipDecider());
+
+        try {
+            $handler->register();
+            self::assertFalse(filter_var(ini_get('zend.exception_ignore_args'), FILTER_VALIDATE_BOOLEAN));
+
+            $handler->unregister();
+            self::assertTrue(filter_var(ini_get('zend.exception_ignore_args'), FILTER_VALIDATE_BOOLEAN));
+        } finally {
+            $handler->unregister();
+            ini_set('zend.exception_ignore_args', $previous);
+        }
+    }
+
+    /**
+     * @template T
+     *
+     * @param Closure(): T $callback
+     *
+     * @return T
+     */
+    private function withErrorReporting(int $level, Closure $callback): mixed
+    {
+        $previous = error_reporting($level);
+
+        try {
+            return $callback();
+        } finally {
+            error_reporting($previous);
+        }
+    }
+
     /**
      * Runs a fixture script in its own PHP process and returns its combined output.
      *
@@ -898,9 +1120,10 @@ final class ErrorHandlerLibTest extends TestCase
         ?Closure $isDebugBarRequest = null,
         ?Closure $addDebugBarMessage = null,
         ?Closure $renderNonCriticalError = null,
-        SuppressedDiagnosticPolicy $suppressedDiagnosticPolicy = SuppressedDiagnosticPolicy::Observe
+        SuppressedDiagnosticPolicy $suppressedDiagnosticPolicy = SuppressedDiagnosticPolicy::Observe,
+        bool $includeTraceArguments = false
     ): ErrorHandlerIntegrationInterface {
-        return new class($describeObject, $renderJavaScriptErrorHandler, $getGlobalInfo, $sanitizeErrorDetails, $renderCriticalError, $shouldEchoOutput, $isTestingEnvironment, $isDebugBarRequest, $addDebugBarMessage, $renderNonCriticalError, $suppressedDiagnosticPolicy) implements ErrorHandlerIntegrationInterface {
+        return new class($describeObject, $renderJavaScriptErrorHandler, $getGlobalInfo, $sanitizeErrorDetails, $renderCriticalError, $shouldEchoOutput, $isTestingEnvironment, $isDebugBarRequest, $addDebugBarMessage, $renderNonCriticalError, $suppressedDiagnosticPolicy, $includeTraceArguments) implements ErrorHandlerIntegrationInterface {
             public function __construct(
                 private readonly ?Closure $describeObject,
                 private readonly ?Closure $renderJavaScriptErrorHandler,
@@ -912,8 +1135,14 @@ final class ErrorHandlerLibTest extends TestCase
                 private readonly ?Closure $isDebugBarRequest,
                 private readonly ?Closure $addDebugBarMessage,
                 private readonly ?Closure $renderNonCriticalError,
-                private readonly SuppressedDiagnosticPolicy $suppressedDiagnosticPolicy
+                private readonly SuppressedDiagnosticPolicy $suppressedDiagnosticPolicy,
+                private readonly bool $includeTraceArguments
             ) {
+            }
+
+            public function includeTraceArguments(): bool
+            {
+                return $this->includeTraceArguments;
             }
 
             public function suppressedDiagnosticPolicy(): SuppressedDiagnosticPolicy
