@@ -106,6 +106,8 @@ All notable changes to this project are documented in this file.
   `display_errors=stderr`, `=stdout` and `=2` counted as off, so the default
   integration's `register()` switched a stderr setup to `Off`; `" on"` counted
   as on, so the library rendered errors that PHP itself would not display.
+  A numeric mode counts by its low byte, as in PHP (`256` is off, `258` is
+  stderr).
 - Anonymous class names no longer truncate log entries. Their NUL byte made
   `error_log()` drop everything after the name; the library now renders them
   the way PHP does (`class@anonymous`).

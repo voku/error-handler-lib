@@ -658,7 +658,9 @@ final class ErrorHandlerLib
                 return 'stderr';
             }
 
-            $mode = (int) $value;
+            // php-src stores the numeric mode in a uint8_t: only the low byte counts, so 256 is off
+            // and 258 is stderr.
+            $mode = ((int) $value) & 0xFF;
 
             return match ($mode) {
                 0 => 'off',

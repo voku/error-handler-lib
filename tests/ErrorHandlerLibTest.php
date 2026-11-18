@@ -1515,7 +1515,7 @@ final class ErrorHandlerLibTest extends TestCase
     public static function provideDisplayDecisions(): iterable
     {
         foreach ([true, false] as $displayErrors) {
-            foreach (['0', '1', '2', 'stderr', 'stdout', ' on'] as $before) {
+            foreach (['0', '1', '2', 'stderr', 'stdout', ' on', '256', '258'] as $before) {
                 $name = sprintf('shouldDisplayErrors() %s, display_errors was "%s"', $displayErrors ? 'true' : 'false', $before);
 
                 yield $name => [$displayErrors, $before];
@@ -1540,7 +1540,7 @@ final class ErrorHandlerLibTest extends TestCase
                 new ErrorHandlerNoOpSkipDecider()
             ))->register();
 
-            $phpDisplays = !in_array($before, ['0', ' on'], true);
+            $phpDisplays = !in_array($before, ['0', ' on', '256'], true);
             $expectDisplayOn = $displayErrors && $phpDisplays;
             // Already effectively off ("0", " on"): register() leaves the value as it is.
             self::assertSame($displayErrors || !$phpDisplays ? $before : 'Off', (string) ini_get('display_errors'));
@@ -1569,6 +1569,9 @@ final class ErrorHandlerLibTest extends TestCase
         yield 'display_errors=1' => ['1', 'stdout'];
         yield 'display_errors=0' => ['0', null];
         yield 'display_errors=" on"' => [' on', null];
+        // php-src keeps the numeric mode in a uint8_t: only the low byte counts.
+        yield 'display_errors=256' => ['256', null];
+        yield 'display_errors=258' => ['258', 'stderr'];
     }
 
     /**
