@@ -191,10 +191,12 @@ final class ErrorHandlerLib
      * Steps 2 and 3 apply to non-critical diagnostics only, so neither a suppression policy
      * nor a skip decider can hide a fatal error or an uncaught exception.
      *
-     * A PHP-suppressed non-critical diagnostic always returns `false`, whatever the policy or the
+     * By default a PHP-suppressed non-critical diagnostic returns `false`, whatever the policy or the
      * skip decider decided. PHP's native handler then respects the suppression (nothing is displayed
      * or logged), but still records the diagnostic, so `error_get_last()` keeps working for code such
-     * as `if (@fopen($path, 'rb') === false) { $error = error_get_last(); }`. A critical diagnostic
+     * as `if (@fopen($path, 'rb') === false) { $error = error_get_last(); }`. An integration whose
+     * {@see ErrorHandlerIntegrationInterface::recordSuppressedDiagnosticsInErrorGetLast()} returns
+     * `false` gets `true` instead, and `error_get_last()` stays untouched. A critical diagnostic
      * never returns: step 1 hands it to the non-returning critical renderer, suppressed or not.
      *
      * @param array<string, scalar|null>     $context
@@ -228,7 +230,7 @@ final class ErrorHandlerLib
         }
 
         if ($this->skipDecider->shouldSkip($errno, $errstr, $errfile, $errline)) {
-            return $suppressedByPhp ? false : true;
+            return $suppressedByPhp ? !$this->integration->recordSuppressedDiagnosticsInErrorGetLast() : true;
         }
 
         if ($this->integration->isDebugBarRequest()) {
@@ -266,7 +268,7 @@ final class ErrorHandlerLib
         }
 
         if ($suppressedByPhp) {
-            return false;
+            return !$this->integration->recordSuppressedDiagnosticsInErrorGetLast();
         }
 
         // Let PHP display it too exactly when PHP itself would: display_errors=stderr or =2 is on,

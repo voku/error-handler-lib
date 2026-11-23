@@ -185,11 +185,18 @@ public function suppressedDiagnosticPolicy(): SuppressedDiagnosticPolicy
 The policy decides *whether* a suppressed diagnostic is processed, not *how*: notices and
 deprecations are only logged or rendered when `isTestingEnvironment()` is true, whatever the policy.
 
-Whatever the policy, the handler returns `false` for a PHP-suppressed non-critical diagnostic.
-A critical one never returns: it goes to the critical renderer, suppressed or not. PHP's native
-handler then still respects the `@` (nothing is displayed or logged), but records the diagnostic,
-so `error_get_last()` keeps working for code such as
+By default, whatever the policy, the handler returns `false` for a PHP-suppressed non-critical
+diagnostic. A critical one never returns: it goes to the critical renderer, suppressed or not.
+PHP's native handler then still respects the `@` (nothing is displayed or logged), but records the
+diagnostic, so `error_get_last()` keeps working for code such as
 `if (@fopen($path, 'rb') === false) { $error = error_get_last(); }`.
+
+Legacy code bases that suppress routinely (`@file_get_contents()` everywhere) may not want that:
+shutdown code or monitoring that reports whatever `error_get_last()` holds would pick up the last
+silenced warning of every request. Their integration returns `false` from
+`recordSuppressedDiagnosticsInErrorGetLast()`; the handler then claims suppressed diagnostics and
+leaves `error_get_last()` untouched. The policy still decides what the library logs and renders.
+`Ignore` always leaves the diagnostic to PHP.
 
 Note that PHPUnit narrows `error_reporting()` to a fatal-only mask while a test runs, so under
 PHPUnit almost every diagnostic looks PHP-suppressed. `Observe` is what keeps the handler useful
@@ -200,7 +207,8 @@ there.
 A skipped diagnostic produces **no observable processing side effects**: no logging, no debug-bar
 entry, no rendering, no counters, no further integration callbacks. `handleError()` returns `true`
 for it, because the host explicitly claimed the diagnostic. The only exception is a PHP-suppressed
-non-critical diagnostic, which returns `false` so that `error_get_last()` keeps working (see above).
+non-critical diagnostic, which by default returns `false` so that `error_get_last()` keeps working
+(see above).
 
 `Ignore` returns `false` instead: the library declines and leaves the diagnostic to PHP.
 

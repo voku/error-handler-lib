@@ -10,6 +10,12 @@ All notable changes to this project are documented in this file.
   Stack traces no longer render argument values unless it returns `true`,
   and `register()` only sets `zend.exception_ignore_args=Off` in that case.
   Return `true` to keep the previous output.
+- `ErrorHandlerIntegrationInterface` now also requires
+  `recordSuppressedDiagnosticsInErrorGetLast(): bool`. With `true` (the default
+  integration's answer) a PHP-suppressed non-critical diagnostic is returned to
+  PHP, so `error_get_last()` sees it. Return `false` to keep the previous
+  behaviour, where the handler claimed it and `error_get_last()` stayed
+  untouched.
 - `new ErrorHandlerLib($integration, $skipDecider)` no longer changes the
   process-wide defaults. Call `ErrorHandlerLib::useIntegration()` explicitly
   if static helpers such as `getTypeInfo()` or `getGlobalJavaScriptErrorHandler()`
@@ -52,9 +58,22 @@ All notable changes to this project are documented in this file.
 
 - **Suppressed diagnostics:** return `SuppressedDiagnosticPolicy::Observe` from
   `suppressedDiagnosticPolicy()` to retain legacy observation and reporting.
-  Suppressed non-critical diagnostics now return `false` to PHP, so callers
-  may see a new value from `error_get_last()`. There is no compatibility flag
-  for the old return behavior. Critical diagnostics are unaffected.
+  Code bases that suppress routinely (`@file_get_contents()` everywhere) and
+  whose shutdown code or monitoring reports whatever `error_get_last()` holds
+  should keep the old return behaviour:
+
+  ```php
+  public function recordSuppressedDiagnosticsInErrorGetLast(): bool
+  {
+      return false; // Legacy: suppressed diagnostics do not reach error_get_last().
+  }
+  ```
+
+  Return `true` for PHP's own semantics, so that code like
+  `if (@fopen($path, 'rb') === false) { $error = error_get_last(); }` works.
+  The flag changes only what PHP records; the library processes the
+  diagnostic according to the policy either way. Critical diagnostics and the
+  `Ignore` policy are unaffected.
 - **Explicit Throwable reporting:** `reportError($throwable)` and
   `reportWarning($throwable)` intentionally omit the throwable's original
   trace. If an existing consumer requires the old text format, pass an

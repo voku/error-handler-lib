@@ -66,6 +66,11 @@ final class ErrorHandlerDefaultIntegration implements ErrorHandlerIntegrationInt
         return false;
     }
 
+    public function recordSuppressedDiagnosticsInErrorGetLast(): bool
+    {
+        return true;
+    }
+
     public function sanitizeErrorDetails(string $details): string
     {
         return $details;

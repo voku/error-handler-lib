@@ -945,6 +945,64 @@ final class ErrorHandlerLibTest extends TestCase
         }
     }
 
+    /**
+     * @return iterable<string, array{SuppressedDiagnosticPolicy, bool, bool}>
+     */
+    public static function provideLegacySuppressionModes(): iterable
+    {
+        // [policy, skip decider skips, PHP still records it]
+        yield 'Observe' => [SuppressedDiagnosticPolicy::Observe, false, false];
+        yield 'LogOnly' => [SuppressedDiagnosticPolicy::LogOnly, false, false];
+        yield 'Observe, skipped by the skip decider' => [SuppressedDiagnosticPolicy::Observe, true, false];
+        yield 'Ignore always leaves it to PHP' => [SuppressedDiagnosticPolicy::Ignore, false, true];
+    }
+
+    /**
+     * Legacy hosts that suppress routinely (`@file_get_contents()` everywhere) can keep
+     * error_get_last() untouched: the handler claims the diagnostic but still processes it.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('provideLegacySuppressionModes')]
+    public function testLegacyHostCanKeepSuppressedDiagnosticsOutOfErrorGetLast(
+        SuppressedDiagnosticPolicy $policy,
+        bool $skip,
+        bool $expectRecorded
+    ): void {
+        $handler = new ErrorHandlerLib(
+            $this->createIntegration(
+                suppressedDiagnosticPolicy: $policy,
+                recordSuppressedDiagnosticsInErrorGetLast: false
+            ),
+            self::skipDecider(static fn (): bool => $skip)
+        );
+
+        $returned = null;
+        $lastError = null;
+        $log = $this->captureErrorLog(function () use ($handler, &$returned, &$lastError): void {
+            error_clear_last();
+            set_error_handler(static function (int $errno, string $errstr, string $errfile, int $errline) use ($handler, &$returned): bool {
+                $returned = $handler->handleError($errno, $errstr, $errfile, $errline);
+
+                return $returned;
+            }, E_ALL);
+
+            try {
+                @trigger_error('legacy suppressed', E_USER_WARNING);
+            } finally {
+                restore_error_handler();
+            }
+
+            $lastError = error_get_last();
+        }, E_ALL);
+
+        self::assertSame(!$expectRecorded, $returned);
+        self::assertSame($expectRecorded, is_array($lastError), 'error_get_last() after the suppressed warning.');
+        self::assertSame(
+            $policy !== SuppressedDiagnosticPolicy::Ignore && !$skip,
+            str_contains($log, 'legacy suppressed'),
+            'The library still processes what the policy and the skip decider let through.'
+        );
+    }
+
     public function testSkippedSuppressedDiagnosticStaysVisibleToErrorGetLast(): void
     {
         $handler = new ErrorHandlerLib(
@@ -2162,9 +2220,10 @@ final class ErrorHandlerLibTest extends TestCase
         SuppressedDiagnosticPolicy $suppressedDiagnosticPolicy = SuppressedDiagnosticPolicy::Observe,
         bool $includeTraceArguments = false,
         ?Closure $includeTraceArgumentsHook = null,
-        ?Closure $shouldDisplayErrors = null
+        ?Closure $shouldDisplayErrors = null,
+        bool $recordSuppressedDiagnosticsInErrorGetLast = true
     ): ErrorHandlerIntegrationInterface {
-        return new class($describeObject, $renderJavaScriptErrorHandler, $getGlobalInfo, $sanitizeErrorDetails, $renderCriticalError, $shouldEchoOutput, $isTestingEnvironment, $isDebugBarRequest, $addDebugBarMessage, $renderNonCriticalError, $suppressedDiagnosticPolicy, $includeTraceArguments, $includeTraceArgumentsHook, $shouldDisplayErrors) implements ErrorHandlerIntegrationInterface {
+        return new class($describeObject, $renderJavaScriptErrorHandler, $getGlobalInfo, $sanitizeErrorDetails, $renderCriticalError, $shouldEchoOutput, $isTestingEnvironment, $isDebugBarRequest, $addDebugBarMessage, $renderNonCriticalError, $suppressedDiagnosticPolicy, $includeTraceArguments, $includeTraceArgumentsHook, $shouldDisplayErrors, $recordSuppressedDiagnosticsInErrorGetLast) implements ErrorHandlerIntegrationInterface {
             public function __construct(
                 private readonly ?Closure $describeObject,
                 private readonly ?Closure $renderJavaScriptErrorHandler,
@@ -2179,8 +2238,14 @@ final class ErrorHandlerLibTest extends TestCase
                 private readonly SuppressedDiagnosticPolicy $suppressedDiagnosticPolicy,
                 private readonly bool $includeTraceArguments,
                 private readonly ?Closure $includeTraceArgumentsHook,
-                private readonly ?Closure $shouldDisplayErrors
+                private readonly ?Closure $shouldDisplayErrors,
+                private readonly bool $recordSuppressedDiagnosticsInErrorGetLast
             ) {
+            }
+
+            public function recordSuppressedDiagnosticsInErrorGetLast(): bool
+            {
+                return $this->recordSuppressedDiagnosticsInErrorGetLast;
             }
 
             public function includeTraceArguments(): bool

@@ -66,6 +66,11 @@ final class LabelledIntegration implements ErrorHandlerIntegrationInterface
         return false;
     }
 
+    public function recordSuppressedDiagnosticsInErrorGetLast(): bool
+    {
+        return true;
+    }
+
     public function sanitizeErrorDetails(string $details): string
     {
         return $details;
