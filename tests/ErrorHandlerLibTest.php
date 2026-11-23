@@ -1438,6 +1438,19 @@ final class ErrorHandlerLibTest extends TestCase
     }
 
     /**
+     * The same recovery inside a shutdown function that runs before the library's dispatcher: the
+     * warning then comes from shutdown code, but the compile error still did not end the script.
+     */
+    #[\PHPUnit\Framework\Attributes\RequiresPhpExtension('Zend OPcache')]
+    public function testCompileErrorRecoveredInsideAShutdownFunctionIsNotReportedAsFatal(): void
+    {
+        $output = $this->runFixture('nested-registration-fatal.php', ['recovered-opcache-compile-error-in-shutdown'], ['-d', 'opcache.enable_cli=1'], null);
+
+        self::assertStringContainsString('OPCACHE-RECOVERED', $output, 'Precondition: the compile error was raised and recovered.');
+        self::assertStringNotContainsString('HANDLED-BY:', $output);
+    }
+
+    /**
      * PHP 8.5 clears the fatal-error backtrace as soon as the next diagnostic is raised, before any
      * error handler runs. The fatal itself is still reported, but without the frames that led to it.
      */

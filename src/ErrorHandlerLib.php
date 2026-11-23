@@ -378,7 +378,8 @@ final class ErrorHandlerLib
      *
      * After a real fatal error only shutdown code runs, and a shutdown function is called by the
      * engine, not from a file: the outermost frame of its call stack has no `file`. Script code,
-     * like the `opcache_compile_file()` call, always starts from a frame in a file.
+     * like the `opcache_compile_file()` call, always starts from a frame in a file. A warning raised
+     * by `opcache_compile_file()` itself is excluded as well, since shutdown code can call it too.
      */
     private static function isRaisedOutsideTheScriptBody(): bool
     {
@@ -392,6 +393,12 @@ final class ErrorHandlerLib
         }
 
         if ($handlerFrame === null || !isset($frames[$handlerFrame + 1])) {
+            return false;
+        }
+
+        // opcache_compile_file() raises its warning after it caught the compile bailout itself:
+        // that compile error did not end anything, even when shutdown code is the caller.
+        if ($frames[$handlerFrame + 1]['function'] === 'opcache_compile_file') {
             return false;
         }
 

@@ -110,21 +110,8 @@ if ($mode === 'host-shutdown-overwrites-last-error') {
     });
 }
 
-// PHP 8.5+ only; older runtimes do not know the directive and ini_set() just returns false.
-ini_set('fatal_error_backtraces', '1');
-
-(new ErrorHandlerLib(new LabelledIntegration('outer')))->register();
-$inner = (new ErrorHandlerLib(new LabelledIntegration('inner')))->register();
-
-if ($mode === 'unregister-inner') {
-    $inner->unregister();
-}
-
-if ($mode === 'recovered-opcache-compile-error') {
-    // opcache_compile_file() catches the compile bailout and returns false; PHP up to 8.4 also
-    // raises a "could not compile" warning, which is what used to make the handler keep a copy of
-    // the compile error. The script recovers and clears the last error, so nothing may be reported
-    // as fatal at shutdown.
+function recoverFromCompileError(): void
+{
     $broken = sys_get_temp_dir() . '/error-handler-lib-compile-error-' . getmypid() . '.php';
     file_put_contents($broken, "<?php\nfunction declaredTwice() {}\nfunction declaredTwice() {}\n");
 
@@ -141,7 +128,39 @@ if ($mode === 'recovered-opcache-compile-error') {
     }
 
     error_clear_last();
+}
 
+if ($mode === 'recovered-opcache-compile-error-in-shutdown') {
+    register_shutdown_function(static function (): void {
+        recoverFromCompileError();
+    });
+}
+
+// PHP 8.5+ only; older runtimes do not know the directive and ini_set() just returns false.
+ini_set('fatal_error_backtraces', '1');
+
+(new ErrorHandlerLib(new LabelledIntegration('outer')))->register();
+$inner = (new ErrorHandlerLib(new LabelledIntegration('inner')))->register();
+
+if ($mode === 'unregister-inner') {
+    $inner->unregister();
+}
+
+if ($mode === 'recovered-opcache-compile-error') {
+    // opcache_compile_file() catches the compile bailout and returns false; PHP up to 8.4 also
+    // raises a "could not compile" warning, which is what used to make the handler keep a copy of
+    // the compile error. The script recovers and clears the last error, so nothing may be reported
+    // as fatal at shutdown.
+    recoverFromCompileError();
+
+    echo "SCRIPT-FINISHED\n";
+
+    return;
+}
+
+if ($mode === 'recovered-opcache-compile-error-in-shutdown') {
+    // The same recovery, but inside a shutdown function that runs before the library's dispatcher
+    // (registered first, in the ordering block above). The warning then comes from shutdown code.
     echo "SCRIPT-FINISHED\n";
 
     return;

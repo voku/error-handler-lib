@@ -114,7 +114,8 @@ All notable changes to this project are documented in this file.
   Values are compared the way PHP parses them (`" on"` is off, `display_errors=2`
   is stderr).
 - A compile error that the script recovered from (`opcache_compile_file()`) is
-  no longer reported as a fatal error at shutdown.
+  no longer reported as a fatal error at shutdown, also when the recovery
+  happens inside an earlier shutdown function.
 - `register()` called from inside an integration hook of the same instance no
   longer installs a second handler pair.
 - A diagnostic raised while a chained exception's report is being built no
