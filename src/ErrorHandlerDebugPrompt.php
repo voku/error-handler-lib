@@ -185,7 +185,10 @@ final class ErrorHandlerDebugPrompt
      */
     private static function callee(array $frame): string
     {
-        $callee = self::frameString($frame, 'class')
+        $class = self::frameString($frame, 'class');
+        // An anonymous class name carries a NUL byte and its file after the readable part.
+        $nul = strpos($class, "\0");
+        $callee = ($nul === false ? $class : substr($class, 0, $nul))
             . self::frameString($frame, 'type')
             . self::frameString($frame, 'function');
 
